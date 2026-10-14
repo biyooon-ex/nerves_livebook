@@ -126,13 +126,22 @@ defmodule NervesLivebook.MixProject do
       {:nerves_system_rpi3, "~> 2.0", runtime: false, targets: :rpi3},
       {:nerves_system_rpi3a, "~> 2.0", runtime: false, targets: :rpi3a},
       {:nerves_system_rpi4, "~> 2.0", runtime: false, targets: :rpi4},
-      {:nerves_system_rpi5, "~> 2.0", runtime: false, targets: :rpi5},
+      # Replaced by :giocci_kiosk_system_rpi5 for kiosk display and USB camera support.
+      # {:nerves_system_rpi5, "~> 2.0", runtime: false, targets: :rpi5},
       {:nerves_system_bbb, "~> 2.29", runtime: false, targets: :bbb},
       {:nerves_system_osd32mp1, "~> 0.24", runtime: false, targets: :osd32mp1},
       {:nerves_system_x86_64, "~> 1.33", runtime: false, targets: :x86_64},
       {:nerves_system_npi_imx6ull, "~> 0.21", runtime: false, targets: :npi_imx6ull},
       {:nerves_system_grisp2, "~> 0.17", runtime: false, targets: :grisp2},
       {:nerves_system_mangopi_mq_pro, "~> 0.15", runtime: false, targets: :mangopi_mq_pro},
+
+      # Added for Giocci dependencies
+      {:giocci, "== 0.6.1", runtime: false},
+      # Please clone the custom system alongside this project before building:
+      #   git clone --branch v2.0.1-gioccidemo https://github.com/biyooon-ex/kiosk_system_rpi5.git ../kiosk_system_rpi5
+      # The first build can take several hours because it compiles the system, including WPE WebKit.
+      {:giocci_kiosk_system_rpi5,
+       path: "../kiosk_system_rpi5", runtime: false, targets: :rpi5, nerves: [compile: true]},
 
       # Compile-time only
       {:credo, "~> 1.6", only: :dev, runtime: false},
@@ -159,7 +168,9 @@ defmodule NervesLivebook.MixProject do
       # false` above, but the release will contain them since they're marked to
       # be loaded below.
       applications: [
-        mndp: :load
+        mndp: :load,
+        giocci: :load,
+        zenohex: :load
       ],
       overwrite: true,
       include_erts: &Nerves.Release.erts/0,
