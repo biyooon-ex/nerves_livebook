@@ -103,6 +103,7 @@ defmodule NervesLivebook.Application do
     defp advertise_device(), do: :ok
   else
     defp target_children(:srhub), do: [NervesLivebook.WiFiMonitor]
+    defp target_children(:rpi5), do: [NervesLivebook.Kiosk]
     defp target_children(_), do: []
 
     defp advertise_device() do
