@@ -136,7 +136,7 @@ defmodule NervesLivebook.MixProject do
       {:nerves_system_mangopi_mq_pro, "~> 0.15", runtime: false, targets: :mangopi_mq_pro},
 
       # Added for Giocci dependencies
-      {:giocci, "== 0.6.2", runtime: false},
+      {:giocci, "== 0.6.3", runtime: false},
       # Please clone the custom system alongside this project before building:
       #   git clone --branch v2.0.1-gioccidemo https://github.com/biyooon-ex/kiosk_system_rpi5.git ../kiosk_system_rpi5
       # The first build can take several hours because it compiles the system, including WPE WebKit.
