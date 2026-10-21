@@ -1,0 +1,1323 @@
+# Giocci Live: Image Demo for Offloading Computation Across the Edge, in Real Time
+
+## Demo overview and preparation
+
+This Livebook is an image processing demo using [Giocci](https://github.com/biyooon-ex/giocci_platform).
+It displays the camera input and processing results in three columns: **Input / Local / Giocci**.
+Switch between Grayscale, Edge detection, and Gaussian blur to compare total call time, kernel time, and FPS.
+
+Set the connection details and run **Evaluate all once** to complete preparation. Press "Start" on the screen to start capturing.
+After that, use the start, stop, and app controls without evaluating the cells again. Switching apps while capturing keeps the camera running. Switching apps while stopped does not start it.
+
+This works with regular Livebook and Nerves Livebook. It uses Giocci v0.6.3.
+The Livebook file is available here.
+
+* https://github.com/biyooon-ex/nerves_livebook/blob/v0.19.0-gioccidemo/priv/giocci/giocci_live_image_demo.livemd
+
+We assume that the Nerves firmware includes Giocci, Zenohex, Kino, StbImage, and support for the camera you use. Elixir/OTP must also be compatible with the Engine.
+To build your own Nerves firmware, use the repositories and branches below. We have tested `:rpi0` (with Pi Camera) and `:rpi5` (with a USB camera).
+
+```bash
+git clone https://github.com/biyooon-ex/nerves_livebook -b v0.19.0-gioccidemo
+git clone https://github.com/biyooon-ex/kiosk_system_rpi5 -b v2.0.1-gioccidemo
+cd nerves_livebook
+export MIX_TARGET=rpi0  # or rpi5
+mix deps.get
+mix firmware  # For rpi5, this takes a very long time because the system is customized for USB camera support!
+mix burn  # Write the firmware to the SD card
+```
+
+In regular Livebook, install the dependencies. On Nerves, check the dependencies included in the firmware.
+This is the Livebook Setup cell. It does not call Mix.install on Nerves.
+
+```elixir
+if Code.ensure_loaded?(Nerves.Runtime) do
+  for module <- [Kino, Kino.Input, Giocci, Giocci.DynamicModule, StbImage] do
+    unless Code.ensure_loaded?(module), do: raise("The firmware needs #{inspect(module)}")
+  end
+else
+  Mix.install([
+    {:kino, "== 0.19.1"},
+    {:giocci, "== 0.6.3", runtime: false},
+    {:stb_image, "~> 0.6.10"}
+  ])
+end
+```
+
+## 1. Connection and camera settings
+
+Set the zenohd address, Relay name, and key_prefix for your environment.
+In `endpoints`, specify a reachable IP address of the server running `zenohd`.
+If you changed the Relay name, you also need to edit `relay`.
+
+This cell configures and starts Giocci, then registers the Client with the Relay. You can check for problems with the IP address or Relay name here.
+If registration fails, check the settings and network, then evaluate the cell again.
+Before changing connection settings while capturing, press "Stop" first.
+
+```elixir
+# Set the zenohd address to one reachable from the Elixir runtime.
+endpoints = ["tcp/127.0.0.1:7447"]
+relay = "giocci_relay"
+key_prefix = ""
+
+# Automatically select the browser for regular Livebook, Pi Camera for Pi Zero, and V4L2 for Pi 5.
+camera_mode = :auto
+camera_device = "/dev/video0"
+
+# Apply the connection settings, start Giocci, and check Relay registration here.
+client_name = "image-demo-#{System.pid()}-#{System.unique_integer([:positive])}"
+
+if List.keymember?(Application.started_applications(), :giocci, 0),
+  do: Application.stop(:giocci)
+
+System.put_env("ZENOHD_CONNECT_ENDPOINTS", Enum.join(endpoints, ","))
+Application.put_env(:giocci, :zenoh_config_file_path, nil)
+Application.put_env(:giocci, :client_name, client_name)
+Application.put_env(:giocci, :key_prefix, key_prefix)
+{:ok, _} = Application.ensure_all_started(:giocci)
+:ok = Giocci.register_client(relay)
+
+IO.puts("Registered Client #{client_name} with #{relay}")
+```
+
+## 2. Define the apps and live processing
+
+Define the three apps, timing helpers, camera capture, independent Local/Giocci processing, and browser UI.
+Add `use Giocci.DynamicModule` to each app so that Giocci keeps the BEAM compiled in Livebook.
+
+```elixir
+defmodule GiocciDemo.Notebook do
+  def now, do: System.monotonic_time(:microsecond)
+  def ms(us), do: Float.round(us / 1000, 3)
+
+  def check!(result, width, height, channels, tag) do
+    case result do
+      %{
+        pixels: pixels,
+        compute_us: us,
+        tag: ^tag,
+        width: ^width,
+        height: ^height,
+        channels: ^channels
+      }
+      when is_binary(pixels) and byte_size(pixels) == width * height * channels and
+             is_integer(us) and us >= 0 ->
+        result
+
+      other ->
+        raise "Invalid image-processing result: #{inspect(other, limit: 5)}"
+    end
+  end
+end
+
+defmodule GiocciDemo.Grayscale do
+  use Giocci.DynamicModule
+
+  def process(rgb, width, height) do
+    unless width > 0 and height > 0 and byte_size(rgb) == width * height * 3,
+      do: raise(ArgumentError, "invalid RGB image")
+
+    # Approximate the weighted RGB sum with integers. The result has 1 byte per pixel.
+    for <<r, g, b <- rgb>>, into: <<>> do
+      <<div(77 * r + 150 * g + 29 * b, 256)>>
+    end
+  end
+
+  def run(rgb, width, height, tag) do
+    {us, pixels} = :timer.tc(fn -> process(rgb, width, height) end)
+    %{pixels: pixels, width: width, height: height, channels: 1, compute_us: us, tag: tag}
+  end
+end
+
+defmodule GiocciDemo.Sobel do
+  use Giocci.DynamicModule
+
+  def process(rgb, width, height) do
+    unless width > 0 and height > 0 and byte_size(rgb) == width * height * 3,
+      do: raise(ArgumentError, "invalid RGB image")
+
+    gray = grayscale(rgb)
+
+    for y <- 0..(height - 1), x <- 0..(width - 1), into: <<>> do
+      if x == 0 or y == 0 or x == width - 1 or y == height - 1 do
+        <<0>>
+      else
+        p = y * width + x
+        a = :binary.at(gray, p - width - 1)
+        b = :binary.at(gray, p - width)
+        c = :binary.at(gray, p - width + 1)
+        d = :binary.at(gray, p - 1)
+        f = :binary.at(gray, p + 1)
+        g = :binary.at(gray, p + width - 1)
+        h = :binary.at(gray, p + width)
+        i = :binary.at(gray, p + width + 1)
+        gx = -a + c - 2 * d + 2 * f - g + i
+        gy = -a - 2 * b - c + g + 2 * h + i
+        # Use an L1 approximation for gradient intensity. The border is black, and intensity is capped at 255.
+        <<min(255, abs(gx) + abs(gy))>>
+      end
+    end
+  end
+
+  # Keep this function inside the module so that save_module only needs to send this module.
+  defp grayscale(rgb) do
+    for <<r, g, b <- rgb>>, into: <<>>, do: <<div(77 * r + 150 * g + 29 * b, 256)>>
+  end
+
+  def run(rgb, width, height, tag) do
+    # Include grayscale conversion in the Sobel processing time.
+    {us, pixels} = :timer.tc(fn -> process(rgb, width, height) end)
+    %{pixels: pixels, width: width, height: height, channels: 1, compute_us: us, tag: tag}
+  end
+end
+
+defmodule GiocciDemo.Gaussian do
+  use Giocci.DynamicModule
+
+  @radius 8
+  @sigma 4.0
+  @weights for d <- -@radius..@radius, do: {d, :math.exp(-d * d / (2 * @sigma * @sigma))}
+  @weight_sum Enum.reduce(@weights, 0.0, fn {_, v}, sum -> sum + v end)
+  @kernel Enum.map(@weights, fn {d, v} -> {d, v / @weight_sum} end)
+
+  def process(rgb, width, height) do
+    unless width > 0 and height > 0 and byte_size(rgb) == width * height * 3,
+      do: raise(ArgumentError, "invalid RGB image")
+
+    # Use the scheduler count on the execution device. Do not create more Tasks than rows.
+    concurrency = min(System.schedulers_online(), height)
+
+    # Split the 17×17 2D convolution into horizontal and vertical passes. Blur each RGB channel separately.
+    # Store intermediate results in a float64 binary to avoid rounding in the horizontal pass.
+    horizontal =
+      parallel_rows(height, concurrency, fn rows ->
+        for y <- rows, x <- 0..(width - 1), channel <- 0..2, into: <<>> do
+          value =
+            Enum.reduce(@kernel, 0.0, fn {dx, weight}, sum ->
+              p = (y * width + clamp(x + dx, width - 1)) * 3 + channel
+              sum + weight * :binary.at(rgb, p)
+            end)
+
+          <<value::float-little-64>>
+        end
+      end)
+
+    parallel_rows(height, concurrency, fn rows ->
+      for y <- rows, x <- 0..(width - 1), channel <- 0..2, into: <<>> do
+        value =
+          Enum.reduce(@kernel, 0.0, fn {dy, weight}, sum ->
+            p = (clamp(y + dy, height - 1) * width + x) * 3 + channel
+            <<value::float-little-64>> = binary_part(horizontal, p * 8, 8)
+            sum + weight * value
+          end)
+
+        <<clamp(round(value), 255)>>
+      end
+    end)
+  end
+
+  # Use edge pixels for positions outside the image (edge clamp).
+  defp clamp(value, maximum), do: max(0, min(maximum, value))
+
+  # With one scheduler, as on Pi Zero, process sequentially without creating Tasks.
+  defp parallel_rows(height, 1, fun), do: fun.(0..(height - 1))
+
+  # Process groups of rows and join the results in row order.
+  # Avoid the default 5-second Task timeout on slow devices. This is separate from the Giocci timeout.
+  defp parallel_rows(height, concurrency, fun) do
+    chunk = div(height + concurrency - 1, concurrency)
+
+    0..(height - 1)
+    |> Enum.chunk_every(chunk)
+    |> Task.async_stream(fun, max_concurrency: concurrency, ordered: true, timeout: :infinity)
+    |> Enum.map(fn {:ok, binary} -> binary end)
+    |> IO.iodata_to_binary()
+  end
+
+  def run(rgb, width, height, tag) do
+    {us, pixels} = :timer.tc(fn -> process(rgb, width, height) end)
+    %{pixels: pixels, width: width, height: height, channels: 3, compute_us: us, tag: tag}
+  end
+end
+
+defmodule GiocciDemo.CameraSource do
+  use GenServer, restart: :temporary
+
+  def detect do
+    if Code.ensure_loaded?(Nerves.Runtime) do
+      platform =
+        if Code.ensure_loaded?(Nerves.Runtime.KV),
+          do: apply(Nerves.Runtime.KV, :get_active, ["nerves_fw_platform"]),
+          else: nil
+
+      model =
+        case File.read("/proc/device-tree/model") do
+          {:ok, value} -> String.trim_trailing(value, <<0>>)
+          _ -> ""
+        end
+
+      cond do
+        platform in ["rpi0", "rpi0_2"] or String.contains?(model, "Zero") -> :picamera
+        platform == "rpi5" or String.contains?(model, "Raspberry Pi 5") -> :usb_v4l2
+        true -> :unknown
+      end
+    else
+      :browser
+    end
+  end
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+
+  @impl true
+  def init(%{owner: owner, config: config}) do
+    Process.flag(:trap_exit, true)
+
+    try do
+      {executable, args, layout} = command(config)
+
+      port =
+        Port.open({:spawn_executable, executable}, [
+          :binary,
+          :exit_status,
+          :use_stdio,
+          :hide,
+          args: args
+        ])
+
+      send(owner, {:source_ready, self()})
+      Process.send_after(self(), :sample, max(1, div(1000, config.fps)))
+
+      {:ok,
+       %{
+         owner: owner,
+         config: config,
+         port: port,
+         layout: layout,
+         buffer: <<>>,
+         latest: nil,
+         waiting: false,
+         skipped: 0
+       }}
+    rescue
+      e -> {:stop, Exception.message(e)}
+    end
+  end
+
+  @impl true
+  def handle_info({port, {:data, data}}, %{port: port} = s) do
+    {latest, rest, count} = take_latest(s.buffer <> data, s.layout.bytes)
+
+    s =
+      if count > 0 do
+        skipped = s.skipped + count - 1 + if(s.latest == nil, do: 0, else: 1)
+        %{s | buffer: rest, latest: latest, skipped: skipped}
+      else
+        %{s | buffer: rest}
+      end
+
+    {:noreply, s}
+  end
+
+  def handle_info(:sample, s) do
+    Process.send_after(self(), :sample, max(1, div(1000, s.config.fps)))
+
+    if s.latest != nil and not s.waiting do
+      rgb = to_rgb(s.latest, s.layout, s.config.width, s.config.height)
+
+      send(
+        s.owner,
+        {:camera_frame, self(), rgb, s.config.width, s.config.height, s.skipped}
+      )
+
+      {:noreply, %{s | latest: nil, waiting: true, skipped: 0}}
+    else
+      {:noreply, s}
+    end
+  end
+
+  def handle_info(:frame_ack, s), do: {:noreply, %{s | waiting: false}}
+
+  def handle_info({port, {:exit_status, code}}, %{port: port} = s) do
+    send(s.owner, {:source_failed, self(), "Capture command exited with code #{code} (check the camera logs)"})
+    {:stop, :normal, %{s | port: nil}}
+  end
+
+  def handle_info({:EXIT, port, reason}, %{port: port} = s) do
+    send(s.owner, {:source_failed, self(), "Camera Port: #{inspect(reason)}"})
+    {:stop, :normal, %{s | port: nil}}
+  end
+
+  def handle_info(_, s), do: {:noreply, s}
+
+  @impl true
+  def terminate(_, s), do: close_port(s.port)
+
+  defp command(%{mode: :picamera} = c) do
+    unless rem(c.width, 64) == 0 and rem(c.height, 16) == 0,
+      do: raise("Pi Camera width must be a multiple of 64 and height a multiple of 16 (YUV row alignment)")
+
+    executable =
+      System.find_executable("rpicam-vid") || System.find_executable("libcamera-vid") ||
+        raise("rpicam-vid / libcamera-vid not found")
+
+    args = [
+      "--nopreview",
+      "--codec",
+      "yuv420",
+      "--flush",
+      "--width",
+      to_string(c.width),
+      "--height",
+      to_string(c.height),
+      "--framerate",
+      to_string(c.fps),
+      "--camera",
+      to_string(c.camera_index),
+      "--timeout",
+      "0",
+      "--output",
+      "-"
+    ]
+
+    {executable, args,
+     %{
+       format: :yuv420,
+       width: c.width,
+       height: c.height,
+       stride: c.width,
+       bytes: div(c.width * c.height * 3, 2)
+     }}
+  end
+
+  defp command(%{mode: :usb_v4l2} = c) do
+    executable = System.find_executable("v4l2-ctl") || raise("v4l2-ctl not found. Check the firmware")
+
+    # Some UVC camera modes only support MJPEG. Request YUYV and check the actual settings.
+    args = [
+      "--device",
+      c.device,
+      "--set-fmt-video=width=#{c.width},height=#{c.height},pixelformat=YUYV",
+      "--get-fmt-video"
+    ]
+
+    {text, status} = System.cmd(executable, args, stderr_to_stdout: true)
+    unless status == 0, do: raise("Failed to configure V4L2:\n#{text}")
+
+    unless Regex.match?(~r/Pixel Format\s*:\s*'YUYV'/, text),
+      do: raise("This capture adapter requires a YUYV-compatible UVC camera:\n#{text}")
+
+    [_, w, h] =
+      Regex.run(~r/Width\/Height\s*:\s*(\d+)\/(\d+)/, text) ||
+        raise("Could not read the V4L2 resolution:\n#{text}")
+
+    w = String.to_integer(w)
+    h = String.to_integer(h)
+    stride = numeric_field(text, ~r/Bytes per Line\s*:\s*(\d+)/, w * 2)
+    bytes = numeric_field(text, ~r/Size Image\s*:\s*(\d+)/, stride * h)
+
+    unless w > 0 and h > 0 and rem(w, 2) == 0 and stride >= w * 2 and bytes >= stride * h and
+             bytes <= 16_000_000,
+           do: raise("Unexpected V4L2 frame layout:\n#{text}")
+
+    # Even if the camera does not support setting FPS, the capture timer can limit the output rate.
+    {_message, fps_status} =
+      System.cmd(executable, ["--device", c.device, "--set-parm=#{c.fps}"], stderr_to_stdout: true)
+
+    if fps_status != 0, do: IO.puts("The camera does not support setting FPS. RGB capture will be limited to #{c.fps} FPS or less")
+
+    args = [
+      "--device",
+      c.device,
+      "--silent",
+      "--stream-mmap=3",
+      "--stream-count=0",
+      "--stream-to=-"
+    ]
+
+    {executable, args, %{format: :yuyv, width: w, height: h, stride: stride, bytes: bytes}}
+  end
+
+  defp numeric_field(text, regex, default) do
+    case Regex.run(regex, text) do
+      [_, value] -> String.to_integer(value)
+      _ -> default
+    end
+  end
+
+  # Port chunks and frames have different boundaries. Separate the latest complete frame from the remaining bytes.
+  def take_latest(buffer, size) do
+    count = div(byte_size(buffer), size)
+
+    if count == 0 do
+      {nil, buffer, 0}
+    else
+      latest = :binary.copy(binary_part(buffer, (count - 1) * size, size))
+      rest = :binary.copy(binary_part(buffer, count * size, rem(byte_size(buffer), size)))
+      {latest, rest, count}
+    end
+  end
+
+  def to_rgb(raw, %{format: :yuv420} = l, width, height) do
+    y_size = l.stride * l.height
+    uv_stride = div(l.stride, 2)
+    uv_size = div(y_size, 4)
+
+    for y <- 0..(height - 1), x <- 0..(width - 1), into: <<>> do
+      sx = div(x * l.width, width)
+      sy = div(y * l.height, height)
+      p = div(sy, 2) * uv_stride + div(sx, 2)
+
+      yuv_pixel(
+        :binary.at(raw, sy * l.stride + sx),
+        :binary.at(raw, y_size + p),
+        :binary.at(raw, y_size + uv_size + p)
+      )
+    end
+  end
+
+  def to_rgb(raw, %{format: :yuyv} = l, width, height) do
+    for y <- 0..(height - 1), x <- 0..(width - 1), into: <<>> do
+      sx = div(x * l.width, width)
+      sy = div(y * l.height, height)
+      p = sy * l.stride + div(sx, 2) * 4
+      yuv_pixel(:binary.at(raw, p + rem(sx, 2) * 2), :binary.at(raw, p + 1), :binary.at(raw, p + 3))
+    end
+  end
+
+  # BT.601 limited-range conversion for the demo. Colors may vary slightly with the camera's color space.
+  defp yuv_pixel(y, u, v) do
+    c = max(0, y - 16)
+    d = u - 128
+    e = v - 128
+    clip = fn n -> max(0, min(255, div(n + 128, 256))) end
+    <<clip.(298 * c + 409 * e), clip.(298 * c - 100 * d - 208 * e), clip.(298 * c + 516 * d)>>
+  end
+
+  defp close_port(nil), do: :ok
+
+  defp close_port(port) do
+    # Stop only the capture process that we started.
+    case Port.info(port, :os_pid) do
+      {:os_pid, pid} ->
+        if kill = System.find_executable("kill"), do: System.cmd(kill, ["-TERM", to_string(pid)])
+
+      _ ->
+        :ok
+    end
+
+    try do
+      Port.close(port)
+    rescue
+      ArgumentError -> :ok
+    end
+  end
+end
+
+defmodule GiocciDemo.LiveImage do
+  use Kino.JS.Live
+
+  # Use the Kino 0.19 asset format and write to a temporary directory instead of priv.
+  # Prepare the archive explicitly to avoid compile-time writes by use Kino.JS.
+  @js ~S"""
+  export function init(ctx, initial) {
+    const [config] = initial;
+    const canvas = document.createElement("canvas");
+    canvas.width = config.width;
+    canvas.height = config.height;
+    canvas.style.cssText = "display:block;width:100%;height:auto;";
+    const message = document.createElement("div");
+    message.style.cssText = "font:12px system-ui;min-height:2.8em;overflow-wrap:anywhere;";
+    ctx.root.append(canvas, message);
+    const context = canvas.getContext("2d");
+    const image = context.createImageData(config.width, config.height);
+
+    function draw([info, buffer]) {
+      const pixels = new Uint8Array(buffer);
+      message.textContent = info.message || "";
+      if (pixels.length === 0) return;
+      if (info.width !== canvas.width || info.height !== canvas.height ||
+          ![1, 3].includes(info.channels) ||
+          pixels.length !== info.width * info.height * info.channels) return;
+
+      // Build the next image in memory and draw it to the fixed Canvas in one step.
+      // Do not erase the previous image with clearRect or by resetting the Canvas size.
+      for (let src = 0, dst = 0; dst < image.data.length; dst += 4) {
+        const r = pixels[src++];
+        image.data[dst] = r;
+        image.data[dst + 1] = info.channels === 1 ? r : pixels[src++];
+        image.data[dst + 2] = info.channels === 1 ? r : pixels[src++];
+        image.data[dst + 3] = 255;
+      }
+      context.putImageData(image, 0, 0);
+    }
+
+    ctx.handleEvent("pixels", draw);
+    ctx.handleEvent("message", text => { message.textContent = text; });
+    draw(initial);
+  }
+  """
+  @hash Base.encode32(:erlang.md5(@js), case: :lower, padding: false)
+
+  def __assets_info__ do
+    path = Path.join(System.tmp_dir!(), "giocci-live-image-#{@hash}.tar.gz")
+    unless File.exists?(path) do
+      :ok = :erl_tar.create(path, [{~c"main.js", @js}], [:compressed])
+    end
+    %{archive_path: path, js_path: "main.js", hash: @hash, cdn_url: nil}
+  end
+
+  def new(width, height), do: Kino.JS.Live.new(__MODULE__, {width, height})
+
+  def update(kino, pixels, width, height, channels) do
+    Kino.JS.Live.cast(kino, {:pixels, pixels, width, height, channels})
+  end
+
+  def message(kino, text), do: Kino.JS.Live.cast(kino, {:message, text})
+
+  @impl true
+  def init({width, height}, ctx) do
+    info = %{width: width, height: height, channels: 3, message: "Waiting for an image"}
+    {:ok, assign(ctx, info: info, pixels: <<>>)}
+  end
+
+  @impl true
+  def handle_connect(ctx) do
+    # Send the latest image to newly opened browsers too.
+    {:ok, {:binary, ctx.assigns.info, ctx.assigns.pixels}, ctx}
+  end
+
+  @impl true
+  def handle_cast({:pixels, pixels, width, height, channels}, ctx) do
+    info = %{width: width, height: height, channels: channels, message: ""}
+    broadcast_event(ctx, "pixels", {:binary, info, pixels})
+    {:noreply, assign(ctx, info: info, pixels: pixels)}
+  end
+
+  def handle_cast({:message, text}, ctx) do
+    broadcast_event(ctx, "message", text)
+    {:noreply, assign(ctx, info: %{ctx.assigns.info | message: text})}
+  end
+end
+
+defmodule GiocciDemo.LiveCompare do
+  use GenServer, restart: :temporary
+  alias GiocciDemo.Notebook, as: N
+  alias GiocciDemo.CameraSource
+  alias GiocciDemo.LiveImage
+
+  # Set a 30-second timeout for the Relay query and another for the Engine result.
+  @remote_timeout_ms 30_000
+  @work_timeout_ms 90_000
+  @retry_delay_ms 10_000
+
+  @apps %{
+    grayscale: {GiocciDemo.Grayscale, 1},
+    sobel: {GiocciDemo.Sobel, 1},
+    gaussian: {GiocciDemo.Gaussian, 3}
+  }
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+  def browser_start(pid, source), do: GenServer.call(pid, {:browser_start, source})
+  def stop(pid), do: GenServer.cast(pid, :stop)
+
+  @impl true
+  def init(opts) do
+    Process.flag(:trap_exit, true)
+    Enum.each(opts.controls, fn {tag, input} -> Kino.Control.subscribe(input, tag) end)
+    Process.send_after(self(), :stats, 1000)
+
+    s =
+      Map.merge(opts, %{
+        running: false,
+        source: nil,
+        epoch: make_ref(),
+        seq: 0,
+        operation: :grayscale,
+        started: N.now(),
+        last_input: N.now(),
+        inputs: [],
+        source_drops: 0,
+        local: lane(),
+        remote: lane(),
+        status: "Stopped"
+      })
+
+    {:ok, s}
+  end
+
+  defp lane do
+    %{
+      worker: nil, pending: nil, retry: nil, count: 0, drops: 0,
+      timeouts: 0, completions: [], last: nil, failed: false
+    }
+  end
+
+  @impl true
+  def handle_call({:browser_start, source}, _from, s) do
+    s = halt(s, "Starting browser camera")
+    s = %{s | source: source, running: true, started: N.now(), last_input: N.now()}
+    {:reply, :ok, %{s | status: "Running / Browser USB camera"}}
+  end
+
+  @impl true
+  def handle_cast(:stop, s), do: {:noreply, halt(s, "Stopped")}
+
+  @impl true
+  def handle_info({:start, _}, %{config: %{mode: :browser}} = s), do: {:noreply, s}
+
+  def handle_info({:start, _}, s) do
+    s = halt(s, "Starting camera")
+
+    case CameraSource.start_link(%{owner: self(), config: s.config}) do
+      {:ok, pid} ->
+        {:noreply,
+         %{s | source: pid, running: true, started: N.now(), last_input: N.now(), status: "Running"}}
+
+      {:error, reason} ->
+        {:noreply, %{s | status: "Failed to start camera: #{inspect(reason)}"}}
+    end
+  end
+
+  def handle_info({:stop, _}, s), do: {:noreply, halt(s, "Stopped")}
+
+  def handle_info({:operation, %{value: operation}}, s) when is_map_key(@apps, operation) do
+    s = cancel_lanes(s)
+    # Ignore completion messages from older generations in later handle_info calls.
+    s = %{
+      s
+      | operation: operation,
+        epoch: make_ref(),
+        local: lane(),
+        remote: lane(),
+        inputs: [],
+        started: N.now(),
+        status: if(s.running, do: "Running", else: "Stopped")
+    }
+
+    Enum.each([s.frames.local, s.frames.remote], fn frame ->
+      LiveImage.message(frame, "#{operation}: Waiting for the next result (previous image retained)")
+    end)
+
+    {:noreply, s}
+  end
+
+  def handle_info({:source_ready, source}, %{source: source} = s) do
+    {:noreply, %{s | status: "Running"}}
+  end
+
+  def handle_info(
+        {:camera_frame, source, rgb, width, height, drops},
+        %{source: source, running: true} = s
+      ) do
+    valid =
+      width == s.config.width and height == s.config.height and
+        is_binary(rgb) and byte_size(rgb) == width * height * 3
+
+    if valid do
+      seq = s.seq + 1
+      tag = {s.epoch, seq}
+
+      frame = %{
+        rgb: rgb,
+        width: width,
+        height: height,
+        tag: tag,
+        seq: seq
+      }
+
+      LiveImage.update(s.frames.input, rgb, width, height, 3)
+
+      s = %{
+        s
+        | seq: seq,
+          last_input: N.now(),
+          inputs: [N.now() | recent(s.inputs)],
+          source_drops: s.source_drops + drops
+      }
+
+      s = s |> offer(:local, frame) |> offer(:remote, frame)
+      # Send one frame at a time from the browser to the runtime too. Do not wait for processing results.
+      send(source, :frame_ack)
+      {:noreply, s}
+    else
+      {:noreply, halt(s, "Invalid camera RGB frame size")}
+    end
+  end
+
+  def handle_info({:source_failed, source, reason}, %{source: source} = s),
+    do: {:noreply, halt(s, reason)}
+
+  def handle_info({:completed, which, token, answer, total_us}, s) do
+    current = Map.fetch!(s, which)
+
+    case current.worker do
+      %{token: ^token} = worker ->
+        Process.demonitor(worker.monitor, [:flush])
+        Process.cancel_timer(worker.timer)
+        current = %{current | worker: nil}
+
+        case answer do
+          {:ok, result} ->
+            frame = worker.frame
+            now = N.now()
+
+            LiveImage.update(
+              Map.fetch!(s.frames, which),
+              result.pixels, frame.width, frame.height, result.channels
+            )
+
+            last = %{
+              seq: frame.seq,
+              compute_us: result.compute_us,
+              total_us: total_us
+            }
+
+            current = %{
+              current
+              | count: current.count + 1,
+                completions: [now | recent(current.completions)],
+                last: last
+            }
+
+            pending = current.pending
+            s = Map.put(s, which, %{current | pending: nil})
+            s = if s.running and pending != nil, do: launch(s, which, pending), else: s
+            {:noreply, s}
+
+          :timeout ->
+            {:noreply, retry_lane(Map.put(s, which, current), which)}
+
+          {:error, reason} ->
+            {:noreply, fail_lane(Map.put(s, which, current), which, reason)}
+        end
+
+      _ ->
+        {:noreply, s}
+    end
+  end
+
+  def handle_info({:work_timeout, which, token}, s) do
+    case Map.fetch!(s, which).worker do
+      %{token: ^token} ->
+        s = Map.update!(s, which, &cancel_lane/1)
+        if which == :remote do
+          {:noreply, retry_lane(s, which)}
+        else
+          {:noreply, fail_lane(s, which, "Local processing timed out. Press Stop, then Start to retry")}
+        end
+
+      _ ->
+        {:noreply, s}
+    end
+  end
+
+  # Keep only the latest frame while retrying. Ignore timers from before a stop or app switch.
+  def handle_info({:retry_lane, which, token}, s) do
+    case Map.fetch!(s, which) do
+      %{retry: %{token: ^token}, pending: pending} = current when s.running ->
+        s = Map.put(s, which, %{current | retry: nil, pending: nil})
+        LiveImage.message(Map.fetch!(s.frames, which), "Retrying… Waiting for a result")
+        {:noreply, if(pending, do: launch(s, which, pending), else: s)}
+
+      _ ->
+        {:noreply, s}
+    end
+  end
+
+  def handle_info({:DOWN, monitor, :process, _pid, reason}, s) do
+    s =
+      Enum.reduce([:local, :remote], s, fn which, acc ->
+        case Map.fetch!(acc, which).worker do
+          %{monitor: ^monitor} ->
+            acc = Map.update!(acc, which, &cancel_lane/1)
+            fail_lane(acc, which, "Processing worker exited: #{inspect(reason)}")
+
+          _ ->
+            acc
+        end
+      end)
+
+    {:noreply, s}
+  end
+
+  def handle_info({:EXIT, source, reason}, %{source: source, running: true} = s),
+    do: {:noreply, halt(%{s | source: nil}, "Camera exited: #{inspect(reason)}")}
+
+  def handle_info(:stats, s) do
+    s =
+      if s.running and N.now() - s.last_input > 15_000_000,
+        do: halt(s, "No frames received for 15 seconds. Check the camera connection"),
+        else: s
+
+    now = N.now()
+    window = min(5_000_000, max(now - s.started, 1)) / 1_000_000
+    fps = fn times -> Float.round(length(recent(times)) / window, 2) end
+    value = fn lane, key -> if lane.last, do: N.ms(lane.last[key]), else: "—" end
+    frame_id = fn lane -> if lane.last, do: lane.last.seq, else: "—" end
+
+    text = """
+    **#{s.status}** / #{s.operation} / #{s.config.width}×#{s.config.height}
+
+    Input FPS (RGB received): **#{fps.(s.inputs)}**
+
+    | Metric | Local | Giocci |
+    | --- | ---: | ---: |
+    | Total call time (ms, latest) | #{value.(s.local, :total_us)} | #{value.(s.remote, :total_us)} |
+    | Kernel time (ms, latest) | #{value.(s.local, :compute_us)} | #{value.(s.remote, :compute_us)} |
+    | Result FPS (last 5 s) | #{fps.(s.local.completions)} | #{fps.(s.remote.completions)} |
+    | Result frame ID | #{frame_id.(s.local)} | #{frame_id.(s.remote)} |
+    | Completed frames | #{s.local.count} | #{s.remote.count} |
+    | Timeouts | #{s.local.timeouts} | #{s.remote.timeouts} |
+    | Frames skipped before processing | #{s.local.drops} | #{s.remote.drops} |
+
+    Frames skipped at capture: **#{s.source_drops}**
+    """
+
+    Kino.Frame.render(s.frames.stats, Kino.Markdown.new(text), temporary: true)
+    Process.send_after(self(), :stats, 1000)
+    {:noreply, s}
+  end
+
+  def handle_info(_, s), do: {:noreply, s}
+
+  defp offer(s, which, frame) do
+    current = Map.fetch!(s, which)
+
+    cond do
+      current.failed ->
+        s
+
+      current.worker == nil and current.retry == nil ->
+        launch(s, which, frame)
+
+      true ->
+        drops = current.drops + if(current.pending == nil, do: 0, else: 1)
+        Map.put(s, which, %{current | pending: frame, drops: drops})
+    end
+  end
+
+  defp launch(s, which, frame) do
+    owner = self()
+    token = make_ref()
+    {module, channels} = Map.fetch!(@apps, s.operation)
+    args = [frame.rgb, frame.width, frame.height, frame.tag]
+    relay = s.relay
+    # Do not wait for heavy processing or Engine queries in the UI/capture process.
+    {pid, monitor} =
+      :erlang.spawn_opt(
+        fn ->
+          {answer, call_us} =
+            try do
+              {call_us, result} =
+                :timer.tc(fn ->
+                  case which do
+                    :local ->
+                      apply(module, :run, args)
+
+                    :remote ->
+                      # Call the synchronous API inside a worker so the UI and Local processing do not wait.
+                      case Giocci.exec_func(relay, {module, :run, args}, timeout: @remote_timeout_ms) do
+                        {:error, reason} -> throw({:giocci_error, reason})
+                        result -> result
+                      end
+                  end
+                end)
+
+              {{:ok, N.check!(result, frame.width, frame.height, channels, frame.tag)}, call_us}
+            rescue
+              e -> {{:error, Exception.message(e)}, nil}
+            catch
+              :throw, {:giocci_error, reason} ->
+                answer = if timeout?(reason), do: :timeout, else: {:error, inspect(reason)}
+                {answer, nil}
+
+              :exit, {:timeout, _call} when which == :remote ->
+                {:timeout, nil}
+
+              kind, reason -> {{:error, "#{kind}: #{inspect(reason)}"}, nil}
+            end
+
+          send(owner, {:completed, which, token, answer, call_us})
+        end,
+        [:link, :monitor]
+      )
+
+    # Limit the total wait, including queries and result waiting inside the API. Cancel when the result arrives normally.
+    timer = Process.send_after(self(), {:work_timeout, which, token}, @work_timeout_ms)
+
+    worker = %{
+      pid: pid,
+      monitor: monitor,
+      token: token,
+      timer: timer,
+      frame: frame
+    }
+
+    Map.update!(s, which, &%{&1 | worker: worker})
+  end
+
+  # Retry only known Giocci timeout formats.
+  defp timeout?(:timeout), do: true
+  defp timeout?({:timeout, _}), do: true
+  defp timeout?("timeout"), do: true
+  defp timeout?("timeout:" <> _), do: true
+  defp timeout?(_), do: false
+
+  defp retry_lane(s, which) do
+    delay = @retry_delay_ms
+    current = Map.fetch!(s, which)
+    token = make_ref()
+    timer = Process.send_after(self(), {:retry_lane, which, token}, delay)
+
+    LiveImage.message(
+      Map.fetch!(s.frames, which),
+      "Retrying… Timeout ##{current.timeouts + 1}; next attempt in #{div(delay, 1000)} s"
+    )
+
+    # Do not resend the failed frame. Drop the pending image too and wait for new input.
+    Map.put(s, which, %{
+      current | worker: nil, pending: nil, retry: %{token: token, timer: timer},
+        timeouts: current.timeouts + 1,
+        drops: current.drops + if(current.pending, do: 1, else: 0)
+    })
+  end
+
+  defp fail_lane(s, which, reason) do
+    LiveImage.message(Map.fetch!(s.frames, which), "#{which}: Stopped / #{reason}")
+
+    Map.update!(s, which, &%{&1 | failed: true, pending: nil})
+  end
+
+  defp recent(times) do
+    cutoff = N.now() - 5_000_000
+    Enum.take_while(times, &(&1 >= cutoff))
+  end
+
+  defp cancel_lane(lane) do
+    if retry = lane.retry, do: Process.cancel_timer(retry.timer)
+
+    if worker = lane.worker do
+      Process.cancel_timer(worker.timer)
+      Process.demonitor(worker.monitor, [:flush])
+      Process.unlink(worker.pid)
+      Process.exit(worker.pid, :kill)
+    end
+
+    %{lane | worker: nil, pending: nil, retry: nil}
+  end
+
+  defp cancel_lanes(s),
+    do: s |> Map.update!(:local, &cancel_lane/1) |> Map.update!(:remote, &cancel_lane/1)
+
+  defp halt(s, message) do
+    if s.source && Process.alive?(s.source) do
+      if s.config.mode == :browser do
+        send(s.source, :stop_camera)
+      else
+        try do
+          GenServer.stop(s.source, :normal, 5000)
+        catch
+          :exit, _ -> :ok
+        end
+      end
+    end
+
+    s = cancel_lanes(s)
+
+    %{
+      s
+      | running: false,
+        source: nil,
+        epoch: make_ref(),
+        local: lane(),
+        remote: lane(),
+        inputs: [],
+        seq: 0,
+        started: N.now(),
+        source_drops: 0,
+        status: message
+    }
+  end
+
+  @impl true
+  def terminate(_, s), do: halt(s, "Finished")
+end
+
+unless Code.ensure_loaded?(Nerves.Runtime) do
+  defmodule GiocciDemo.BrowserCamera do
+    use Kino.JS
+    use Kino.JS.Live
+
+    def new(controller, config), do: Kino.JS.Live.new(__MODULE__, {controller, config})
+
+    @impl true
+    def init({controller, config}, ctx) do
+      Process.monitor(controller)
+      {:ok, assign(ctx, controller: controller, config: config, owner: nil, session: nil)}
+    end
+
+    @impl true
+    def handle_connect(ctx) do
+      {:ok, Map.take(ctx.assigns.config, [:width, :height, :fps]), ctx}
+    end
+
+    @impl true
+    def handle_event("start", %{"session" => session}, ctx) do
+      if ctx.assigns.owner == nil do
+        :ok = GiocciDemo.LiveCompare.browser_start(ctx.assigns.controller, self())
+        send_event(ctx, ctx.origin, "started", %{session: session})
+        {:noreply, assign(ctx, owner: ctx.origin, session: session)}
+      else
+        send_event(ctx, ctx.origin, "rejected", %{message: "Another camera session is running. Stop it first."})
+        {:noreply, ctx}
+      end
+    end
+
+    def handle_event("frame", {:binary, info, rgb}, ctx) do
+      c = ctx.assigns.config
+
+      if ctx.origin == ctx.assigns.owner and info["session"] == ctx.assigns.session and
+           byte_size(rgb) == c.width * c.height * 3 do
+        send(
+          ctx.assigns.controller,
+          {:camera_frame, self(), rgb, c.width, c.height, 0}
+        )
+      end
+
+      {:noreply, ctx}
+    end
+
+    def handle_event("stop", %{"session" => session}, ctx) do
+      if ctx.origin == ctx.assigns.owner and session == ctx.assigns.session do
+        GiocciDemo.LiveCompare.stop(ctx.assigns.controller)
+      end
+
+      {:noreply, ctx}
+    end
+
+    @impl true
+    def handle_info(:frame_ack, ctx) do
+      if ctx.assigns.owner,
+        do: send_event(ctx, ctx.assigns.owner, "ack", %{session: ctx.assigns.session})
+
+      {:noreply, ctx}
+    end
+
+    def handle_info(:stop_camera, ctx) do
+      if ctx.assigns.owner,
+        do: send_event(ctx, ctx.assigns.owner, "stop", %{session: ctx.assigns.session})
+
+      {:noreply, assign(ctx, owner: nil, session: nil)}
+    end
+
+    def handle_info({:DOWN, _, :process, _, _}, ctx) do
+      broadcast_event(ctx, "shutdown", %{})
+      {:noreply, assign(ctx, owner: nil, session: nil)}
+    end
+
+    asset "main.js" do
+      ~S"""
+      export function init(ctx, config) {
+        ctx.root.innerHTML = `
+          <div style="font:14px system-ui;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <select aria-label="Select USB camera"></select>
+            <button class="start">Start browser camera</button>
+            <button class="stop" disabled>Stop</button>
+            <span class="status">Select a USB camera</span>
+            <video muted playsinline style="display:none"></video>
+          </div>`;
+        const select = ctx.root.querySelector('select');
+        const start = ctx.root.querySelector('.start');
+        const stop = ctx.root.querySelector('.stop');
+        const status = ctx.root.querySelector('.status');
+        const video = ctx.root.querySelector('video');
+        const canvas = document.createElement('canvas');
+        canvas.width = config.width; canvas.height = config.height;
+        const drawing = canvas.getContext('2d', {willReadFrequently: true});
+        let stream = null, timer = null, watchdog = null, active = false, session = null, sequence = 0;
+
+        async function devices(preferred) {
+          const list = await navigator.mediaDevices.enumerateDevices();
+          const selected = preferred || select.value;
+          select.replaceChildren(new Option('Auto (select a USB camera recommended)', ''));
+          list.filter(d => d.kind === 'videoinput').forEach((d, i) => {
+            select.add(new Option(d.label || `Camera ${i + 1}`, d.deviceId));
+          });
+          if ([...select.options].some(o => o.value === selected)) select.value = selected;
+        }
+
+        function cleanup(notify = true) {
+          clearTimeout(timer); clearTimeout(watchdog);
+          if (notify && session) ctx.pushEvent('stop', {session});
+          if (stream) stream.getTracks().forEach(t => t.stop());
+          stream = null; video.srcObject = null; active = false;
+          start.disabled = false; stop.disabled = true; select.disabled = false;
+          status.textContent = 'Stopped';
+          session = null;
+        }
+
+        function sample() {
+          if (!active || !stream) return;
+          // Keep the aspect ratio and use black padding. Use the same RGB for the input and both execution destinations.
+          drawing.fillStyle = '#000'; drawing.fillRect(0, 0, config.width, config.height);
+          const scale = Math.min(config.width / video.videoWidth, config.height / video.videoHeight);
+          const w = Math.round(video.videoWidth * scale), h = Math.round(video.videoHeight * scale);
+          drawing.drawImage(video, Math.floor((config.width - w) / 2), Math.floor((config.height - h) / 2), w, h);
+          const rgba = drawing.getImageData(0, 0, config.width, config.height).data;
+          const rgb = new Uint8Array(config.width * config.height * 3);
+          for (let i = 0, j = 0; i < rgba.length; i += 4) {
+            rgb[j++] = rgba[i]; rgb[j++] = rgba[i+1]; rgb[j++] = rgba[i+2];
+          }
+          ctx.pushEvent('frame', [{session}, rgb.buffer]);
+          // Wait for ACK before sending the next frame. Do not accumulate arrays during communication.
+          watchdog = setTimeout(() => { cleanup(); status.textContent += ' / No response from runtime'; }, 15000);
+        }
+
+        start.onclick = async () => {
+          if (stream || active) return;
+          start.disabled = true; select.disabled = true;
+          const requestedSession = String(++sequence);
+          session = requestedSession;
+          try {
+            if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia)
+              throw new Error('Open Livebook via localhost or HTTPS');
+            const deviceId = select.value;
+            const acquired = await navigator.mediaDevices.getUserMedia({audio: false, video: {
+              width: {ideal: config.width}, height: {ideal: config.height},
+              ...(deviceId ? {deviceId: {exact: deviceId}} : {})
+            }});
+            // Release the camera even if the cell is removed or stopped while the permission dialog is open.
+            if (session !== requestedSession || !ctx.root.isConnected) {
+              acquired.getTracks().forEach(t => t.stop()); return;
+            }
+            stream = acquired; video.srcObject = stream; await video.play();
+            await devices(stream.getVideoTracks()[0].getSettings().deviceId);
+            stop.disabled = false;
+            ctx.pushEvent('start', {session});
+            watchdog = setTimeout(() => { cleanup(); status.textContent += ' / No response to start request'; }, 15000);
+          } catch (e) {
+            cleanup(); status.textContent += ` / ${e.message}`;
+          }
+        };
+        stop.onclick = () => cleanup();
+        ctx.handleEvent('started', data => {
+          if (data.session !== session) return;
+          clearTimeout(watchdog); active = true;
+          status.textContent = `Capturing / ${config.width}×${config.height}`;
+          sample();
+        });
+        ctx.handleEvent('ack', data => {
+          if (!active || data.session !== session) return;
+          clearTimeout(watchdog); timer = setTimeout(sample, 1000 / config.fps);
+        });
+        ctx.handleEvent('stop', data => { if (data.session === session) cleanup(false); });
+        ctx.handleEvent('rejected', data => { cleanup(false); status.textContent += ` / ${data.message}`; });
+        ctx.handleEvent('shutdown', () => cleanup(false));
+        window.addEventListener('pagehide', () => cleanup());
+        // Stop when the embedded area is removed too. pagehide handles full-page navigation.
+        const observer = new MutationObserver(() => {
+          if (!ctx.root.isConnected) { cleanup(); observer.disconnect(); }
+        });
+        observer.observe(document.documentElement, {childList: true, subtree: true});
+        if (navigator.mediaDevices?.enumerateDevices) devices().catch(() => {});
+      }
+      """
+    end
+  end
+end
+```
+
+## 3. Distribute the apps and prepare the display
+
+Use the Client registered in "1. Connection and camera settings" to distribute each of the three apps with save_module and display the controls.
+Once ready, press "Start" on Nerves. In regular Livebook, select a browser camera and start it.
+You do not need to evaluate this cell again when starting, stopping, or switching apps.
+Before changing settings or filter code, stop first, then evaluate the changed cell and the following cells again.
+
+```elixir
+# Distribute the BEAM kept by use Giocci.DynamicModule using only the module name.
+for module <- [GiocciDemo.Grayscale, GiocciDemo.Sobel, GiocciDemo.Gaussian] do
+  :ok = Giocci.save_module(relay, module)
+end
+
+# You can select :auto / :browser (regular Livebook) / :picamera / :usb_v4l2.
+detected_mode = GiocciDemo.CameraSource.detect()
+camera_mode = if camera_mode == :auto, do: detected_mode, else: camera_mode
+
+unless camera_mode in [:browser, :picamera, :usb_v4l2],
+  do: raise("Cannot detect the input source. Set camera_mode explicitly")
+
+if camera_mode == :browser and Code.ensure_loaded?(Nerves.Runtime),
+  do: raise("On Nerves, select :picamera or :usb_v4l2")
+
+# Use a fixed image size for the live comparison. Use a smaller size on Pi Zero to reduce the load.
+{live_width, live_height, input_fps} =
+  if camera_mode == :picamera, do: {192, 128, 5}, else: {320, 240, 10}
+
+camera_config = %{
+  mode: camera_mode,
+  width: live_width,
+  height: live_height,
+  fps: input_fps,
+  device: camera_device,
+  camera_index: 0
+}
+
+# When this cell is evaluated again, Kino stops the old controller and releases the camera and workers too.
+operation_control =
+  Kino.Input.select("App", grayscale: "Grayscale", sobel: "Edge detection", gaussian: "Gaussian blur")
+
+start_control = Kino.Control.button("Start (Nerves camera)")
+stop_control = Kino.Control.button("Stop")
+
+frames = %{
+  input: GiocciDemo.LiveImage.new(live_width, live_height),
+  local: GiocciDemo.LiveImage.new(live_width, live_height),
+  remote: GiocciDemo.LiveImage.new(live_width, live_height),
+  stats: Kino.Frame.new()
+}
+
+{:ok, live_pid} =
+  Kino.start_child(
+    {GiocciDemo.LiveCompare,
+     %{
+       config: camera_config,
+       relay: relay,
+       frames: frames,
+       controls: [start: start_control, stop: stop_control, operation: operation_control]
+     }}
+  )
+
+Kino.render(
+  Kino.Markdown.new("**Input: #{camera_mode} / #{live_width}×#{live_height} / Requested limit: #{input_fps} FPS**")
+)
+
+Kino.render(operation_control)
+
+if camera_mode == :browser do
+  Kino.render(GiocciDemo.BrowserCamera.new(live_pid, camera_config))
+  Kino.render(stop_control)
+else
+  Kino.render(Kino.Layout.grid([start_control, stop_control], columns: 2))
+end
+
+Kino.render(
+  Kino.Layout.grid(
+    for {title, frame} <- [{"Input", frames.input}, {"Local", frames.local}, {"Giocci", frames.remote}] do
+      Kino.Layout.grid([Kino.Markdown.new("**#{title}**"), frame])
+    end,
+    columns: 3
+  )
+)
+
+Kino.render(frames.stats)
+
+:ok
+```
+
+## Trouble shooting
+
+Check that Zenohd is running, that the IP address in `endpoints` is correct, and that the Relay and Engine are running correctly.
+You can also find explanations in [giocci_live_handson.livemd](https://github.com/biyooon-ex/nerves_livebook/blob/v0.19.0-gioccidemo/priv/giocci/giocci_live_handson.livemd).
+
+You can find me on the Elixir, Nerves, and AtomVM Discord servers! I am also in the Elixir, Erlang, and EEF Slack Workspaces. If you have any trouble, please contact `@takasehideki`!

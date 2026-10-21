@@ -1,0 +1,751 @@
+# Giocci Live: Hands-on for Offloading Computation Across the Edge, in Real Time
+
+## Introduction
+
+Welcome to [Code BEAM Europe 2026 Informal Space](https://codebeameurope.com/informal-space/)!
+
+This Livebook contains the hands-on material for the following session.
+
+* **Giocci Live: Offloading Computation Across the Edge, in Real Time**
+  * Day 2 Thursday 22 October 10:50–11:30
+  * Yutaka Kikuchi & Hideki Takase
+
+### What is Giocci?
+
+[Giocci](https://github.com/biyooon-ex/giocci_platform) is a resource-permeating computing platform for wide-area distributed systems.
+We introduced the concepts and architecture of Giocci in detail at [Goatmire Elixir 2025](https://2025.goatmire.com/)!
+
+* Slides: https://speakerdeck.com/takasehideki/giocci-a-resource-permeating-computing-platform-for-wide-area-distributed-systems
+* Video: https://goatmire.bold.video/v/9wjke
+
+Here are the features of Giocci in three lines.
+
+1. Giocci has a three-layer architecture: Client, Relay, and Engine.
+2. You can offload heavy Elixir processing from low-power devices to powerful devices or servers.
+3. For communication between resources, we use [zenohex](https://github.com/biyooon-ex/zenohex), an Elixir client library for the lightweight and flexible [Zenoh](https://zenoh.io/) protocol (this is also one of our products!).
+
+We have introduced Giocci at Code BEAM and other conferences several times. But the quickest way to understand this platform is to try it yourself. So we prepared this step-by-step hands-on session. Please give it a try and have fun!
+
+### Let's get started
+
+This Livebook is available here.
+
+* https://github.com/biyooon-ex/nerves_livebook/blob/v0.19.0-gioccidemo/priv/giocci/giocci_live_handson.livemd
+
+It also works with the regular [Livebook](https://livebook.dev/) native app on your PC.
+
+At the session, we also have Raspberry Pi 5 devices with Nerves Livebook installed.
+You need to connect to the Wi-Fi AP for this session and open the Nerves device in your web browser. We will share these details at the venue.
+
+Please try it on your own device too!
+
+## 1. Environment preparation (Livebook Setup cell)
+
+To use Giocci, you need computers running Zenohd, Relay, and Engine.
+See the following guides to install them.
+
+* Zenohd: See the "Installing the Zenoh router" section on [this page](https://zenoh.io/docs/getting-started/installation/).
+* Giocci Relay: https://github.com/biyooon-ex/giocci_platform/blob/v0.6.3/apps/giocci_relay/README.md
+* Giocci Engine: https://github.com/biyooon-ex/giocci_platform/blob/v0.6.3/apps/giocci_engine/README.md
+
+To set up your own environment, prepare a computer with port 7447 open and docker available, then follow the guides above. You mainly need to edit `config/giocci_{relay,engine}.exs` and `config/zenoh.json5`. You can also run all three on your own PC.
+
+For the session, we have prepared the following environment on Azure.
+
+| server                | spec             | region               |
+| --------------------- | ---------------- | -------------------- |
+| biyooon-zenohd        | 2 vcpu / 8 GiB   | Belgium Central      |
+| biyooon-relay         | 2 vcpu / 8 GiB   | Belgium Central      |
+| biyooon-engine-yowai  | 2 vcpu / 8 GiB   | Belgium Central      |
+| biyooon-engine-futsuu | 4 vcpu / 16 GiB  | Germany West Central |
+| biyooon-engine-tsuyoi | 16 vcpu / 64 GiB | Belgium Central      |
+
+In regular Livebook, the next cell installs Kino, Giocci, Req, and StbImage.
+On Nerves, we assume that Giocci, Zenohex, Kino, Req, and StbImage are included in the firmware. The cell checks the dependencies in the firmware.
+
+```elixir
+if Code.ensure_loaded?(Nerves.Runtime) do
+  for module <- [Kino, Giocci, Giocci.DynamicModule, Giocci.Inspect, Req, StbImage] do
+    unless Code.ensure_loaded?(module), do: raise("The firmware needs #{inspect(module)}")
+  end
+else
+  Mix.install([
+    {:kino, "== 0.19.1"},
+    {:giocci, "== 0.6.3", runtime: false},
+    {:req, "~> 0.5.8"},
+    {:stb_image, "~> 0.6.10"}
+  ])
+end
+```
+
+## 2. Get, prepare, and display the input image
+
+This hands-on session uses image processing as an example.
+
+First, use Req to get the input image from a URL and resize it to a width of 320 px while keeping its aspect ratio.
+To use a different image, change `image_url`.
+
+We also define the helper functions used in the following steps.
+
+```elixir
+# Fetch the image from the Elixir runtime and pass the HTTP body directly to the image decoder.
+image_url =
+  "https://pbs.twimg.com/profile_images/2108086088661450752/G4pqmMEl_400x400.jpg"
+
+response = Req.get!(image_url, decode_body: false, retry: false)
+unless response.status == 200,
+  do: raise("Failed to fetch the image (HTTP #{response.status})")
+
+input_image = StbImage.read_binary!(response.body, channels: 3)
+
+# Calculate the height from the aspect ratio. Do not crop to a square or add padding.
+{source_height, source_width, 3} = input_image.shape
+width = 320
+height = max(1, round(source_height * width / source_width))
+rgb = StbImage.resize(input_image, height, width).data
+
+defmodule GiocciHandson.Notebook do
+  def now, do: System.monotonic_time(:microsecond)
+  def ms(us), do: Float.round(us / 1000, 3)
+
+  def image(pixels, width, height, channels) do
+    Kino.Image.new(<<height::32, width::32, channels::8, pixels::binary>>, :pixel)
+  end
+
+  def panel(title, pixels, width, height, channels) do
+    Kino.Layout.grid([Kino.Markdown.new("**#{title}**"), image(pixels, width, height, channels)],
+      gap: 8
+    )
+  end
+
+  def check!(result, width, height, channels, tag) do
+    case result do
+      %{
+        pixels: pixels,
+        compute_us: us,
+        tag: ^tag,
+        width: ^width,
+        height: ^height,
+        channels: ^channels
+      }
+      when is_binary(pixels) and byte_size(pixels) == width * height * channels and
+             is_integer(us) and us >= 0 ->
+        result
+
+      other ->
+        raise "Invalid image processing result: #{inspect(other, limit: 5)}"
+    end
+  end
+
+  def comparison(rgb, width, height, local, local_us, remote, remote_us, label) do
+    same = if local.pixels == remote.pixels, do: "Identical", else: "Different (check rounding errors or the distributed version)"
+
+    Kino.Layout.grid([
+      Kino.Markdown.new("""
+      **#{label}** — Byte-by-byte output comparison: **#{same}**
+
+      | Execution destination | Total call time (ms) | Kernel time (ms) |
+      | --- | ---: | ---: |
+      | Local | #{ms(local_us)} | #{ms(local.compute_us)} |
+      | Giocci | #{ms(remote_us)} | #{ms(remote.compute_us)} |
+      """),
+      Kino.Layout.grid(
+        [
+          panel("Input", rgb, width, height, 3),
+          panel("Local", local.pixels, width, height, local.channels),
+          panel("Giocci", remote.pixels, width, height, remote.channels)
+        ],
+        columns: 3
+      )
+    ])
+  end
+end
+
+Kino.render(GiocciHandson.Notebook.panel("Input image / #{width}×#{height}", rgb, width, height, 3))
+
+:ok
+```
+
+## 3. Grayscale: run locally first
+
+Convert RGB to grayscale using the integer weighted sum `(77*r + 150*g + 29*b) / 256`.
+`run/4` returns the image, the computation time, and a tag used to match the result to the call.
+Define the Grayscale module and run it locally first.
+
+When defining the module, add `use Giocci.DynamicModule` so that Giocci keeps the compiled BEAM.
+
+```elixir
+defmodule GiocciHandson.Grayscale do
+  use Giocci.DynamicModule
+
+  def process(rgb, width, height) do
+    unless width > 0 and height > 0 and byte_size(rgb) == width * height * 3,
+      do: raise(ArgumentError, "invalid RGB image")
+
+    # Approximate the weighted RGB sum with integers. The result has 1 byte per pixel.
+    for <<r, g, b <- rgb>>, into: <<>> do
+      <<div(77 * r + 150 * g + 29 * b, 256)>>
+    end
+  end
+
+  def run(rgb, width, height, tag) do
+    {us, pixels} = :timer.tc(fn -> process(rgb, width, height) end)
+    %{pixels: pixels, width: width, height: height, channels: 1, compute_us: us, tag: tag}
+  end
+end
+
+{grayscale_local_us, grayscale_local} =
+  :timer.tc(fn -> GiocciHandson.Grayscale.run(rgb, width, height, :still) end)
+
+IO.puts(
+  "Local / Grayscale: Total call time #{GiocciHandson.Notebook.ms(grayscale_local_us)} ms / Kernel time #{GiocciHandson.Notebook.ms(grayscale_local.compute_us)} ms"
+)
+
+Kino.render(
+  GiocciHandson.Notebook.image(grayscale_local.pixels, width, height, grayscale_local.channels)
+)
+
+:ok
+```
+
+## 4. Run Grayscale with Giocci
+
+Now, let's try Giocci!
+
+There are three steps.
+
+### a) Register the Client with the Relay
+
+Use [`register_client/2`](https://giocci.hexdocs.pm/Giocci.html#register_client/2) to register the Client with the Relay.
+You only need to do this once when the Client starts.
+
+Set the following four values.
+
+* Client name: You do not need to change this for this hands-on session.
+* Relay name to register with:
+  * If you use a Raspberry Pi 5 at the venue, use the value we provide.
+  * If you have your own server, use its Relay name.
+* Server running Zenohd:
+  * If you use a Raspberry Pi 5 at the venue, use the value we provide.
+  * If you have your own server, use its IP address.
+  * If you run it on your own PC, you do not need to change `127.0.0.1`.
+* Zenoh key prefix (optional): You usually do not need to change this.
+
+In a regular mix project, you can set these values in [`config/config.exs`](https://giocci.hexdocs.pm/readme.html#configuration) and `zenoh.json5`.
+
+After setting these values, run the next cell.
+
+```elixir
+client_name = "image-demo-#{System.pid()}-#{System.unique_integer([:positive])}"
+relay = "giocci_relay"
+endpoints = ["tcp/127.0.0.1:7447"]
+key_prefix = ""
+
+Application.put_env(:giocci, :client_name, client_name)
+System.put_env("ZENOHD_CONNECT_ENDPOINTS", Enum.join(endpoints, ","))
+Application.put_env(:giocci, :zenoh_config_file_path, nil)
+Application.put_env(:giocci, :key_prefix, key_prefix)
+
+if List.keymember?(Application.started_applications(), :giocci, 0),
+  do: Application.stop(:giocci)
+{:ok, _} = Application.ensure_all_started(:giocci)
+
+:ok = Giocci.register_client(relay)
+
+IO.puts("Registered Client #{client_name} with #{relay}")
+```
+
+### b) Save the module
+
+Use [`save_module/3`](https://giocci.hexdocs.pm/Giocci.html#save_module/3) to save the Client's module.
+You only need to do this once for each module. If you change the module definition, run it again.
+
+Pass the Relay name and the module name as arguments.
+
+```elixir
+:ok = Giocci.save_module(relay, GiocciHandson.Grayscale)
+```
+
+### c) Execute the function
+
+Use [`exec_func/3`](https://giocci.hexdocs.pm/Giocci.html#exec_func/3) to execute a function on an Engine.
+Pass the Relay name and `{module_name, function_name, arguments}` as arguments.
+
+With this API, the Client asks the Relay for a suitable Engine for remote execution (the current implementation uses round-robin selection...).
+
+```elixir
+{grayscale_remote_us, grayscale_remote} =
+  :timer.tc(fn ->
+    Giocci.exec_func(relay, {GiocciHandson.Grayscale, :run, [rgb, width, height, :still]})
+  end)
+
+GiocciHandson.Notebook.check!(grayscale_remote, width, height, 1, :still)
+
+Kino.render(
+  GiocciHandson.Notebook.comparison(
+    rgb,
+    width,
+    height,
+    grayscale_local,
+    grayscale_local_us,
+    grayscale_remote,
+    grayscale_remote_us,
+    "Grayscale"
+  )
+)
+
+:ok
+```
+
+## 5. Edge detection
+
+Hmm, Grayscale may not get much faster... It is probably because this is a light task even for the Client.
+Let's run a slightly heavier task remotely with Giocci.
+
+The Sobel filter in the next demo detects edges in the image (the module converts the image to grayscale first).
+The intensity is `abs(gx) + abs(gy)`, capped at 255. The outermost 1-pixel border is black.
+
+Define the edge detection (Sobel) module and run it locally first.
+Use `use Giocci.DynamicModule` so that Giocci keeps the compiled BEAM.
+
+```elixir
+defmodule GiocciHandson.Sobel do
+  use Giocci.DynamicModule
+
+  def process(rgb, width, height) do
+    unless width > 0 and height > 0 and byte_size(rgb) == width * height * 3,
+      do: raise(ArgumentError, "invalid RGB image")
+
+    gray = grayscale(rgb)
+
+    for y <- 0..(height - 1), x <- 0..(width - 1), into: <<>> do
+      if x == 0 or y == 0 or x == width - 1 or y == height - 1 do
+        <<0>>
+      else
+        p = y * width + x
+        a = :binary.at(gray, p - width - 1)
+        b = :binary.at(gray, p - width)
+        c = :binary.at(gray, p - width + 1)
+        d = :binary.at(gray, p - 1)
+        f = :binary.at(gray, p + 1)
+        g = :binary.at(gray, p + width - 1)
+        h = :binary.at(gray, p + width)
+        i = :binary.at(gray, p + width + 1)
+        gx = -a + c - 2 * d + 2 * f - g + i
+        gy = -a - 2 * b - c + g + 2 * h + i
+        # Use an L1 approximation for gradient intensity. The border is black, and intensity is capped at 255.
+        <<min(255, abs(gx) + abs(gy))>>
+      end
+    end
+  end
+
+  # Keep this function inside the module so that save_module only needs to send this module.
+  defp grayscale(rgb) do
+    for <<r, g, b <- rgb>>, into: <<>>, do: <<div(77 * r + 150 * g + 29 * b, 256)>>
+  end
+
+  def run(rgb, width, height, tag) do
+    # Include grayscale conversion in the Sobel processing time.
+    {us, pixels} = :timer.tc(fn -> process(rgb, width, height) end)
+    %{pixels: pixels, width: width, height: height, channels: 1, compute_us: us, tag: tag}
+  end
+end
+
+{sobel_local_us, sobel_local} =
+  :timer.tc(fn -> GiocciHandson.Sobel.run(rgb, width, height, :still) end)
+
+IO.puts(
+  "Local / Edge detection (Sobel): Total call time #{GiocciHandson.Notebook.ms(sobel_local_us)} ms / Kernel time #{GiocciHandson.Notebook.ms(sobel_local.compute_us)} ms"
+)
+
+Kino.render(GiocciHandson.Notebook.image(sobel_local.pixels, width, height, sobel_local.channels))
+
+:ok
+```
+
+Distribute this edge detection (Sobel) module to the server too, and process the same RGB image with Giocci.
+Display the total call time and kernel time, and compare the output with Local.
+
+```elixir
+# Distribute the dynamically defined module using only its module name.
+:ok = Giocci.save_module(relay, GiocciHandson.Sobel)
+
+{sobel_remote_us, sobel_remote} =
+  :timer.tc(fn ->
+    Giocci.exec_func(relay, {GiocciHandson.Sobel, :run, [rgb, width, height, :still]})
+  end)
+
+GiocciHandson.Notebook.check!(sobel_remote, width, height, 1, :still)
+
+Kino.render(
+  GiocciHandson.Notebook.comparison(
+    rgb,
+    width,
+    height,
+    sobel_local,
+    sobel_local_us,
+    sobel_remote,
+    sobel_remote_us,
+    "Edge detection (Sobel)"
+  )
+)
+
+:ok
+```
+
+## 6. Gaussian blur
+
+Let's run an even heavier task!
+
+Apply a Gaussian filter to a color image.
+Split the convolution into two passes, horizontal and vertical. Use the edge pixels for positions outside the image.
+Also, split each pass into groups of rows and process them in parallel based on `System.schedulers_online()` on the execution device.
+
+Define the Gaussian blur module and run it locally first. Use `use Giocci.DynamicModule` so that Giocci keeps the compiled BEAM.
+
+```elixir
+defmodule GiocciHandson.Gaussian do
+  use Giocci.DynamicModule
+
+  @radius 8
+  @sigma 4.0
+  @weights for d <- -@radius..@radius, do: {d, :math.exp(-d * d / (2 * @sigma * @sigma))}
+  @weight_sum Enum.reduce(@weights, 0.0, fn {_, v}, sum -> sum + v end)
+  @kernel Enum.map(@weights, fn {d, v} -> {d, v / @weight_sum} end)
+
+  def process(rgb, width, height) do
+    unless width > 0 and height > 0 and byte_size(rgb) == width * height * 3,
+      do: raise(ArgumentError, "invalid RGB image")
+
+    # Use the scheduler count on the execution device. Do not create more Tasks than rows.
+    concurrency = min(System.schedulers_online(), height)
+
+    # Split the 17×17 2D convolution into horizontal and vertical passes. Blur each RGB channel separately.
+    # Store intermediate results in a float64 binary to avoid rounding in the horizontal pass.
+    horizontal =
+      parallel_rows(height, concurrency, fn rows ->
+        for y <- rows, x <- 0..(width - 1), channel <- 0..2, into: <<>> do
+          value =
+            Enum.reduce(@kernel, 0.0, fn {dx, weight}, sum ->
+              p = (y * width + clamp(x + dx, width - 1)) * 3 + channel
+              sum + weight * :binary.at(rgb, p)
+            end)
+
+          <<value::float-little-64>>
+        end
+      end)
+
+    parallel_rows(height, concurrency, fn rows ->
+      for y <- rows, x <- 0..(width - 1), channel <- 0..2, into: <<>> do
+        value =
+          Enum.reduce(@kernel, 0.0, fn {dy, weight}, sum ->
+            p = (clamp(y + dy, height - 1) * width + x) * 3 + channel
+            <<value::float-little-64>> = binary_part(horizontal, p * 8, 8)
+            sum + weight * value
+          end)
+
+        <<clamp(round(value), 255)>>
+      end
+    end)
+  end
+
+  # Use edge pixels for positions outside the image (edge clamp).
+  defp clamp(value, maximum), do: max(0, min(maximum, value))
+
+  # With one scheduler, as on Pi Zero, process sequentially without creating Tasks.
+  defp parallel_rows(height, 1, fun), do: fun.(0..(height - 1))
+
+  # Process groups of rows and join the results in row order.
+  # Avoid the default 5-second Task timeout on slow devices. This is separate from the Giocci timeout.
+  defp parallel_rows(height, concurrency, fun) do
+    chunk = div(height + concurrency - 1, concurrency)
+
+    0..(height - 1)
+    |> Enum.chunk_every(chunk)
+    |> Task.async_stream(fun, max_concurrency: concurrency, ordered: true, timeout: :infinity)
+    |> Enum.map(fn {:ok, binary} -> binary end)
+    |> IO.iodata_to_binary()
+  end
+
+  def run(rgb, width, height, tag) do
+    {us, pixels} = :timer.tc(fn -> process(rgb, width, height) end)
+    %{pixels: pixels, width: width, height: height, channels: 3, compute_us: us, tag: tag}
+  end
+end
+
+{gaussian_local_us, gaussian_local} =
+  :timer.tc(fn -> GiocciHandson.Gaussian.run(rgb, width, height, :still) end)
+
+IO.puts(
+  "Local / Gaussian blur: Total call time #{GiocciHandson.Notebook.ms(gaussian_local_us)} ms / Kernel time #{GiocciHandson.Notebook.ms(gaussian_local.compute_us)} ms"
+)
+
+Kino.render(
+  GiocciHandson.Notebook.image(gaussian_local.pixels, width, height, gaussian_local.channels)
+)
+
+:ok
+```
+
+Distribute this module to the server too, and process the same RGB image with Giocci. Display the total call time and kernel time, and compare the output with Local.
+
+```elixir
+# Distribute the dynamically defined module using only its module name.
+:ok = Giocci.save_module(relay, GiocciHandson.Gaussian)
+
+{gaussian_remote_us, gaussian_remote} =
+  :timer.tc(fn ->
+    Giocci.exec_func(relay, {GiocciHandson.Gaussian, :run, [rgb, width, height, :still]})
+  end)
+
+GiocciHandson.Notebook.check!(gaussian_remote, width, height, 3, :still)
+
+Kino.render(
+  GiocciHandson.Notebook.comparison(
+    rgb,
+    width,
+    height,
+    gaussian_local,
+    gaussian_local_us,
+    gaussian_remote,
+    gaussian_remote_us,
+    "Gaussian blur"
+  )
+)
+
+:ok
+```
+
+### Run with the asynchronous API
+
+Giocci can also execute functions asynchronously.
+After sending the execution request, you can continue local work without waiting for the result.
+
+[`exec_func_async/4`](https://giocci.hexdocs.pm/Giocci.html#exec_func_async/4) returns `:ok` when the send request is accepted. The computation result arrives at the specified process as `{:giocci, result}`.
+
+The module has already been distributed above, so we can use it as it is.
+
+First, define a small receiver process that keeps the result across cells.
+
+```elixir
+defmodule GiocciHandson.AsyncResult do
+  use GenServer
+
+  def start_link(_), do: GenServer.start_link(__MODULE__, nil)
+
+  @impl true
+  def init(_), do: {:ok, %{result: nil, waiter: nil}}
+
+  @impl true
+  def handle_info({:giocci, result}, state) do
+    received = {GiocciHandson.Notebook.now(), result}
+    if state.waiter, do: GenServer.reply(state.waiter, received)
+    {:noreply, %{state | result: received, waiter: nil}}
+  end
+
+  @impl true
+  def handle_call(:result, from, %{result: nil} = state) do
+    # If the result is not ready, reply when it arrives.
+    {:noreply, %{state | waiter: from}}
+  end
+
+  def handle_call(:result, _from, state), do: {:reply, state.result, state}
+end
+```
+
+Start the receiver process and send the Gaussian task asynchronously. This cell does not wait for image processing to finish.
+Let Kino manage the receiver process.
+
+```elixir
+{:ok, gaussian_receiver} = Kino.start_child({GiocciHandson.AsyncResult, []})
+gaussian_async_tag = make_ref()
+
+# Measure from just before the call until the result arrives at the dedicated process.
+gaussian_async_started = GiocciHandson.Notebook.now()
+:ok = Giocci.exec_func_async(
+  relay,
+  {GiocciHandson.Gaussian, :run, [rgb, width, height, gaussian_async_tag]},
+  gaussian_receiver
+)
+
+IO.puts("Request sent. You can do other local work while waiting for the result.")
+:ok
+```
+
+Get the received result and compare it with the Local image. If it has already arrived, display it immediately. Otherwise, wait for up to 5 seconds.
+
+```elixir
+{gaussian_async_received, gaussian_async_result} = GenServer.call(gaussian_receiver, :result)
+gaussian_async_us = gaussian_async_received - gaussian_async_started
+
+GiocciHandson.Notebook.check!(gaussian_async_result, width, height, 3, gaussian_async_tag)
+
+Kino.render(
+  GiocciHandson.Notebook.comparison(
+    rgb, width, height,
+    gaussian_local, gaussian_local_us,
+    gaussian_async_result, gaussian_async_us,
+    "Gaussian blur / Giocci Async"
+  )
+)
+
+:ok
+```
+
+## 7. Check connections and saved code with Inspect
+
+[`Giocci.Inspect`](https://giocci.hexdocs.pm/Giocci.Inspect.html) lets you check Giocci connections, registrations, and BEAMs saved on the Relay (it was added in [v0.6.2](https://github.com/biyooon-ex/giocci_platform/releases/tag/v0.6.2), released just last week!).
+After running the three apps, review the remote execution environments and the saved code.
+
+First, check your Client name, key_prefix, Zenoh ID, the IDs of connected Routers/Peers, and registered Relays.
+
+`list_relays` uses this Client's registration history to ask each Relay about its current registration status.
+If only some Relays can be confirmed, it returns `{:warn, confirmed_relays, issues}`, so we display the return value as it is.
+
+`connection_info` provides information about your Zenoh session.
+
+```elixir
+IO.inspect(Giocci.Inspect.connection_info(), label: "Client / Zenoh connection info")
+IO.inspect(Giocci.Inspect.list_relays(), label: "Registered Relay check")
+
+:ok
+```
+
+Next, check the Relay's execution environment and response. The `rtt_ms` value from `ping_relay` is the round-trip time of a Giocci Query/Reply.
+
+```elixir
+IO.inspect(Giocci.Inspect.relay_info(relay), label: "Relay environment")
+IO.inspect(Giocci.Inspect.ping_relay(relay), label: "Relay response check")
+```
+
+Get the Engines registered with the Relay, and check each Engine's execution environment and response.
+`engine_info` and `ping_engine` query the Engine directly using only its name.
+
+`schedulers_online` is the number of BEAM schedulers running in parallel.
+
+```elixir
+{:ok, engines} = Giocci.Inspect.list_engines(relay)
+IO.inspect(engines, label: "Registered Engines")
+
+for engine <- engines do
+  IO.inspect(Giocci.Inspect.engine_info(engine), label: "Engine #{engine} environment")
+  IO.inspect(Giocci.Inspect.ping_engine(engine), label: "Engine #{engine} response check")
+end
+
+:ok
+```
+
+Finally, check the modules saved on the Relay under this Client name, their public functions, and their saved information.
+If you have followed the steps in order, the three modules for Grayscale, Sobel, and Gaussian are already saved.
+`list_modules` returns module names as strings. You can pass them directly to the following APIs.
+`list_functions` returns function names and argument counts, such as `{"process", 3}` and `{"run", 4}`. It does not include private functions.
+
+```elixir
+{:ok, saved_modules} = Giocci.Inspect.list_modules(relay)
+IO.inspect(saved_modules, label: "Saved modules for this Client")
+
+for module <- saved_modules do
+  IO.inspect(Giocci.Inspect.list_functions(relay, module), label: "#{module} public functions")
+  IO.inspect(Giocci.Inspect.module_info(relay, module), label: "#{module} saved info")
+end
+
+:ok
+```
+
+## 8. Run each of the three apps three times and compare
+
+Can Giocci actually make processing faster?
+
+For each app, alternate between Local and the Giocci synchronous API, running each three times.
+We measure the total function call time, including communication, and the kernel time for the filter itself.
+When multiple Engines are registered, the execution destination changes between measurements.
+
+The Giocci total time includes Engine selection, sending and receiving data, waiting, and receiving the result.
+For light tasks such as Grayscale, we can also observe that Giocci may be slower because of communication time.
+Measure three times with the same input image and display each value and the average. Also display the Local/Giocci images from the third run of each app side by side.
+
+```elixir
+apps = [
+  {"Grayscale", GiocciHandson.Grayscale, 1},
+  {"Edge detection", GiocciHandson.Sobel, 1},
+  {"Gaussian blur", GiocciHandson.Gaussian, 3}
+]
+
+benchmark_results =
+  for {label, module, channels} <- apps do
+    runs =
+      for trial <- 1..3 do
+        tag = {:benchmark, trial}
+
+        {local_us, local_result} =
+          :timer.tc(fn -> apply(module, :run, [rgb, width, height, tag]) end)
+
+        {remote_us, remote_result} =
+          :timer.tc(fn ->
+            Giocci.exec_func(relay, {module, :run, [rgb, width, height, tag]})
+          end)
+
+        GiocciHandson.Notebook.check!(remote_result, width, height, channels, tag)
+
+        %{local_us: local_us, remote_us: remote_us, local: local_result, remote: remote_result}
+      end
+
+    {label, runs}
+  end
+
+rows =
+  for {label, runs} <- benchmark_results, side <- [:local, :remote] do
+    key = if side == :local, do: :local_us, else: :remote_us
+    times = Enum.map(runs, &Map.fetch!(&1, key))
+    mean = Enum.sum(times) / 3
+    compute_mean = Enum.sum(Enum.map(runs, &Map.fetch!(&1, side).compute_us)) / 3
+
+    values =
+      Enum.map_join(
+        times ++ [mean, compute_mean],
+        " | ",
+        &to_string(GiocciHandson.Notebook.ms(&1))
+      )
+
+    "| #{label} | #{side} | #{values} |"
+  end
+
+Kino.render(
+  Kino.Markdown.new("""
+  | App | Execution destination | Call 1 (ms) | Call 2 (ms) | Call 3 (ms) | Average call time (ms) | Average kernel time (ms) |
+  | --- | --- | ---: | ---: | ---: | ---: | ---: |
+  #{Enum.join(rows, "\n")}
+  """)
+)
+
+comparisons =
+  for {label, runs} <- benchmark_results do
+    last = List.last(runs)
+
+    GiocciHandson.Notebook.comparison(
+      rgb,
+      width,
+      height,
+      last.local,
+      last.local_us,
+      last.remote,
+      last.remote_us,
+      "#{label} / Run 3"
+    )
+  end
+
+Kino.render(Kino.Layout.grid(comparisons, gap: 24))
+
+:ok
+```
+
+## Did it work?
+
+Next, please try the demo in [giocci_live_image_demo.livemd](https://github.com/biyooon-ex/nerves_livebook/blob/v0.19.0-gioccidemo/priv/giocci/giocci_live_image_demo.livemd)!
+
+For Trouble shooting, check that Zenohd is running, that the IP address in `endpoints` is correct, and that the Relay and Engine are running correctly.
+
+You can find me on the Elixir, Nerves, and AtomVM Discord servers! I am also in the Elixir, Erlang, and EEF Slack Workspaces. If you have any trouble, please contact `@takasehideki`!
+
+We continue our research and development to improve Giocci!
+Recently, we have been working on Giocci support for embedded microcontrollers running AtomVM, to achieve "More with Less". We hope to share our latest results at Code BEAM and ElixirConf again!
