@@ -10,15 +10,53 @@ Set the connection details and run **Evaluate all once** to complete preparation
 After that, use the start, stop, and app controls without evaluating the cells again. Switching apps while capturing keeps the camera running. Switching apps while stopped does not start it.
 
 This works with regular Livebook and Nerves Livebook. It uses Giocci v0.6.3.
+Local processing runs in the Livebook's Elixir runtime; Giocci processing runs on an Engine. The browser displays the results.
+One Engine is enough. With multiple Engines, the execution destination may change between calls. The speed difference depends on the devices, available BEAM schedulers, and network; Local can be faster.
+Kiosk and a touchscreen are optional. You can also view Nerves Livebook from a PC browser.
 The Livebook file is available here.
 
 * https://github.com/biyooon-ex/nerves_livebook/blob/v0.19.0-gioccidemo/priv/giocci/giocci_live_image_demo.livemd
 
-We assume that the Nerves firmware includes Giocci, Zenohex, Kino, StbImage, and support for the camera you use. Elixir/OTP must also be compatible with the Engine.
+### Giocci environment
+
+This Livebook runs as a Giocci Client. Before running the cells, prepare a Zenoh Router (Zenohd), a Relay, and at least one Engine registered with that Relay.
+You can use an existing environment or set up your own. They can run on one PC, on separate machines in your LAN, or in the cloud. Azure is not required.
+
+This notebook uses Giocci v0.6.3. Use the same Giocci version for the Relay and Engine, and compatible Elixir/OTP versions so that the Engine can load the BEAM compiled by the Client.
+For a first setup, using the same Elixir/OTP versions is the simplest choice.
+
+To set up your own environment, follow these guides:
+
+* Zenohd: See the "Installing the Zenoh router" section on [this page](https://zenoh.io/docs/getting-started/installation/).
+* Giocci Relay: https://github.com/biyooon-ex/giocci_platform/blob/v0.6.3/apps/giocci_relay/README.md
+* Giocci Engine: https://github.com/biyooon-ex/giocci_platform/blob/v0.6.3/apps/giocci_engine/README.md
+
+The guides describe the Docker setup and the Relay, Engine, and Zenoh configuration files. For the TCP endpoint used below, allow access to the Zenoh Router's listening port (7447 by default) from the Client, Relay, and Engine.
+Use matching `key_prefix` values, and configure the Engine to register with your Relay. Give each Relay and each Engine its own name when running multiple instances. One Engine is enough to run the whole notebook.
+
+### Camera input
+
+| Livebook runtime | Input selected by `camera_mode = :auto` | What you need |
+| --- | --- | --- |
+| Regular Livebook | `:browser` | A camera connected to the computer running the browser, and camera permission. |
+| Nerves on Pi Zero | `:picamera` | A working Pi Camera and `rpicam-vid` or `libcamera-vid` in the firmware. |
+| Nerves on Pi 5 | `:usb_v4l2` | A USB camera that supports YUYV, kernel support, and `v4l2-ctl` in the firmware. |
+
+Auto selection checks the runtime and board type; it does not check whether a camera is connected.
+For another Nerves board, set `camera_mode` explicitly and prepare the required camera support. These other boards have not been tested here.
+In this notebook, browser capture is only enabled for regular Livebook. Nerves captures from its own camera, even when you open the page on a PC.
+For browser capture, open Livebook on `localhost` or HTTPS and allow camera access. See the [browser camera requirements](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia#privacy_and_security).
+Without a camera, use [the hands-on notebook](https://github.com/biyooon-ex/nerves_livebook/blob/v0.19.0-gioccidemo/priv/giocci/giocci_live_handson.livemd) instead.
+
+### Nerves firmware (optional)
+
+Skip this step for regular Livebook or a Nerves device with the required firmware already installed.
+We assume that the Nerves firmware includes Giocci, Zenohex, Kino, StbImage, and support for the camera you use.
 To build your own Nerves firmware, use the repositories and branches below. We have tested `:rpi0` (with Pi Camera) and `:rpi5` (with a USB camera).
 
 ```bash
 git clone https://github.com/biyooon-ex/nerves_livebook -b v0.19.0-gioccidemo
+# For rpi5, clone the custom system next to nerves_livebook. Skip this clone for rpi0.
 git clone https://github.com/biyooon-ex/kiosk_system_rpi5 -b v2.0.1-gioccidemo
 cd nerves_livebook
 export MIX_TARGET=rpi0  # or rpi5
@@ -27,12 +65,14 @@ mix firmware  # For rpi5, this takes a very long time because the system is cust
 mix burn  # Write the firmware to the SD card
 ```
 
+### Livebook dependencies
+
 In regular Livebook, install the dependencies. On Nerves, check the dependencies included in the firmware.
 This is the Livebook Setup cell. It does not call Mix.install on Nerves.
 
 ```elixir
 if Code.ensure_loaded?(Nerves.Runtime) do
-  for module <- [Kino, Kino.Input, Giocci, Giocci.DynamicModule, StbImage] do
+  for module <- [Kino, Kino.Input, Giocci, Giocci.DynamicModule, Giocci.Inspect, StbImage] do
     unless Code.ensure_loaded?(module), do: raise("The firmware needs #{inspect(module)}")
   end
 else
@@ -46,12 +86,22 @@ end
 
 ## 1. Connection and camera settings
 
-Set the zenohd address, Relay name, and key_prefix for your environment.
-In `endpoints`, specify a reachable IP address of the server running `zenohd`.
-If you changed the Relay name, you also need to edit `relay`.
+| Setting | What to enter |
+| --- | --- |
+| `endpoints` | The Zenoh Router address reachable from the Livebook's Elixir runtime. |
+| `relay` | The configured Relay name, not its IP address or hostname. |
+| `key_prefix` | The same prefix as the Relay and Engine. Keep `""` if they use the default. |
+| `client_name` | A name for this Client. The cell generates a default; use a different name for each Client when sharing an environment. |
 
-This cell configures and starts Giocci, then registers the Client with the Relay. You can check for problems with the IP address or Relay name here.
-If registration fails, check the settings and network, then evaluate the cell again.
+At the session, use the connection details provided by the hosts. For your own environment, use the values from your configuration.
+`127.0.0.1` means the machine or container running the Elixir code, not necessarily the PC displaying this page. On Nerves, it means the Nerves device. If Zenohd runs elsewhere, replace it with an address reachable from that runtime.
+
+These settings apply to the Giocci application in the Elixir runtime. Avoid running the hands-on notebook and camera demo at the same time in a shared runtime, because the connection cell restarts that application.
+
+Keep `camera_mode = :auto` for the tested setups above. For `:usb_v4l2`, set `camera_device` to your camera's capture device; `/dev/video0` is only the default.
+
+This cell configures and starts Giocci, registers the Client with the Relay, and checks for registered Engines. You can check for problems with the address, Relay name, or Engine registration here.
+If registration or the check fails, check the settings and network, start the missing services, then evaluate the cell again.
 Before changing connection settings while capturing, press "Stop" first.
 
 ```elixir
@@ -78,6 +128,11 @@ Application.put_env(:giocci, :key_prefix, key_prefix)
 :ok = Giocci.register_client(relay)
 
 IO.puts("Registered Client #{client_name} with #{relay}")
+
+# Check registration now; this does not guarantee that every Engine is still reachable.
+{:ok, registered_engines} = Giocci.Inspect.list_engines(relay)
+if registered_engines == [], do: raise("No Engines registered with #{relay}. Start an Engine and try again")
+IO.inspect(registered_engines, label: "Registered Engines")
 ```
 
 ## 2. Define the apps and live processing
@@ -1317,7 +1372,11 @@ Kino.render(frames.stats)
 
 ## Trouble shooting
 
-Check that Zenohd is running, that the IP address in `endpoints` is correct, and that the Relay and Engine are running correctly.
+* Connection: check `endpoints`, `relay`, and `key_prefix`, and that Zenohd, the Relay, and the Engine are running.
+* Camera: check browser permissions for `:browser`. On Nerves, check the camera connection, capture command, and `camera_device` for USB input. Selecting a mode does not add missing firmware support.
+* Remote execution: check the Engine logs and Elixir/OTP compatibility. A registered Engine may no longer be reachable.
+* Kiosk display: try opening the same notebook from a PC browser to help separate a display problem from a processing problem.
+
 You can also find explanations in [giocci_live_handson.livemd](https://github.com/biyooon-ex/nerves_livebook/blob/v0.19.0-gioccidemo/priv/giocci/giocci_live_handson.livemd).
 
 You can find me on the Elixir, Nerves, and AtomVM Discord servers! I am also in the Elixir, Erlang, and EEF Slack Workspaces. If you have any trouble, please contact `@takasehideki`!

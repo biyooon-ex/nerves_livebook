@@ -2,9 +2,10 @@
 
 ## Introduction
 
-Welcome to [Code BEAM Europe 2026 Informal Space](https://codebeameurope.com/informal-space/)!
+This Livebook is a step-by-step introduction to Giocci. You can use it on your own PC or a Nerves device, with an existing Giocci environment or your own Relay and Engine.
+It uses a fixed image from a URL, so no camera or touchscreen is needed.
 
-This Livebook contains the hands-on material for the following session.
+It was prepared for the following session at [Code BEAM Europe 2026 Informal Space](https://codebeameurope.com/informal-space/).
 
 * **Giocci Live: Offloading Computation Across the Edge, in Real Time**
   * Day 2 Thursday 22 October 10:50–11:30
@@ -39,29 +40,30 @@ You need to connect to the Wi-Fi AP for this session and open the Nerves device 
 
 Please try it on your own device too!
 
-## 1. Environment preparation (Livebook Setup cell)
+## 1. Environment preparation
 
-To use Giocci, you need computers running Zenohd, Relay, and Engine.
-See the following guides to install them.
+### Giocci environment
+
+This Livebook runs as a Giocci Client. Before running the cells, prepare a Zenoh Router (Zenohd), a Relay, and at least one Engine registered with that Relay.
+You can use an existing environment or set up your own. They can run on one PC, on separate machines in your LAN, or in the cloud. Azure is not required.
+
+This notebook uses Giocci v0.6.3. Use the same Giocci version for the Relay and Engine, and compatible Elixir/OTP versions so that the Engine can load the BEAM compiled by the Client.
+For a first setup, using the same Elixir/OTP versions is the simplest choice.
+
+To set up your own environment, follow these guides:
 
 * Zenohd: See the "Installing the Zenoh router" section on [this page](https://zenoh.io/docs/getting-started/installation/).
 * Giocci Relay: https://github.com/biyooon-ex/giocci_platform/blob/v0.6.3/apps/giocci_relay/README.md
 * Giocci Engine: https://github.com/biyooon-ex/giocci_platform/blob/v0.6.3/apps/giocci_engine/README.md
 
-To set up your own environment, prepare a computer with port 7447 open and docker available, then follow the guides above. You mainly need to edit `config/giocci_{relay,engine}.exs` and `config/zenoh.json5`. You can also run all three on your own PC.
+The guides describe the Docker setup and the Relay, Engine, and Zenoh configuration files. For the TCP endpoint used below, allow access to the Zenoh Router's listening port (7447 by default) from the Client, Relay, and Engine.
+Use matching `key_prefix` values, and configure the Engine to register with your Relay. Give each Relay and each Engine its own name when running multiple instances. One Engine is enough to run the whole notebook.
 
-For the session, we have prepared the following environment on Azure.
-
-| server                | spec             | region               |
-| --------------------- | ---------------- | -------------------- |
-| biyooon-zenohd        | 2 vcpu / 8 GiB   | Belgium Central      |
-| biyooon-relay         | 2 vcpu / 8 GiB   | Belgium Central      |
-| biyooon-engine-yowai  | 2 vcpu / 8 GiB   | Belgium Central      |
-| biyooon-engine-futsuu | 4 vcpu / 16 GiB  | Germany West Central |
-| biyooon-engine-tsuyoi | 16 vcpu / 64 GiB | Belgium Central      |
+### Livebook dependencies
 
 In regular Livebook, the next cell installs Kino, Giocci, Req, and StbImage.
 On Nerves, we assume that Giocci, Zenohex, Kino, Req, and StbImage are included in the firmware. The cell checks the dependencies in the firmware.
+The Elixir runtime also needs Internet access to download the image in section 2. Kiosk is optional; you can view Nerves Livebook from a PC browser.
 
 ```elixir
 if Code.ensure_loaded?(Nerves.Runtime) do
@@ -76,6 +78,51 @@ else
     {:stb_image, "~> 0.6.10"}
   ])
 end
+```
+
+### Connection settings and registration
+
+| Setting       | What to enter                                                                                                           |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `endpoints`   | The Zenoh Router address reachable from the Livebook's Elixir runtime.                                                  |
+| `relay`       | The configured Relay name, not its IP address or hostname.                                                              |
+| `key_prefix`  | The same prefix as the Relay and Engine. Keep `""` if they use the default.                                             |
+| `client_name` | A name for this Client. The cell generates a default; use a different name for each Client when sharing an environment. |
+
+At the session, use the connection details provided by the hosts. For your own environment, use the values from your configuration.
+`127.0.0.1` means the machine or container running the Elixir code, not necessarily the PC displaying this page. On Nerves, it means the Nerves device. If Zenohd runs elsewhere, replace it with an address reachable from that runtime.
+
+These settings apply to the Giocci application in the Elixir runtime. Avoid running the hands-on notebook and camera demo at the same time in a shared runtime, because the connection cell restarts that application.
+
+In a regular Mix project, you can set these values in [`config/config.exs`](https://giocci.hexdocs.pm/readme.html#configuration) and `zenoh.json5`.
+
+The next cell starts Giocci, calls [`register_client/2`](https://giocci.hexdocs.pm/Giocci.html#register_client/2), and checks for registered Engines.
+If registration or the check fails, check your settings and start the missing services, then evaluate the cell again. We explore Inspect in more detail in section 7.
+
+```elixir
+# Change these values to match your Giocci environment.
+client_name = "image-demo-#{System.pid()}-#{System.unique_integer([:positive])}"
+relay = "giocci_relay"
+endpoints = ["tcp/127.0.0.1:7447"]
+key_prefix = ""
+
+Application.put_env(:giocci, :client_name, client_name)
+System.put_env("ZENOHD_CONNECT_ENDPOINTS", Enum.join(endpoints, ","))
+Application.put_env(:giocci, :zenoh_config_file_path, nil)
+Application.put_env(:giocci, :key_prefix, key_prefix)
+
+if List.keymember?(Application.started_applications(), :giocci, 0),
+  do: Application.stop(:giocci)
+{:ok, _} = Application.ensure_all_started(:giocci)
+
+:ok = Giocci.register_client(relay)
+
+IO.puts("Registered Client #{client_name} with #{relay}")
+
+# Check registration now; this does not guarantee that every Engine is still reachable.
+{:ok, registered_engines} = Giocci.Inspect.list_engines(relay)
+if registered_engines == [], do: raise("No Engines registered with #{relay}. Start an Engine and try again")
+IO.inspect(registered_engines, label: "Registered Engines")
 ```
 
 ## 2. Get, prepare, and display the input image
@@ -212,48 +259,15 @@ Kino.render(
 
 Now, let's try Giocci!
 
-There are three steps.
+Remote execution uses three steps: register the Client, save the module, and execute the function.
 
 ### a) Register the Client with the Relay
 
 Use [`register_client/2`](https://giocci.hexdocs.pm/Giocci.html#register_client/2) to register the Client with the Relay.
 You only need to do this once when the Client starts.
 
-Set the following four values.
-
-* Client name: You do not need to change this for this hands-on session.
-* Relay name to register with:
-  * If you use a Raspberry Pi 5 at the venue, use the value we provide.
-  * If you have your own server, use its Relay name.
-* Server running Zenohd:
-  * If you use a Raspberry Pi 5 at the venue, use the value we provide.
-  * If you have your own server, use its IP address.
-  * If you run it on your own PC, you do not need to change `127.0.0.1`.
-* Zenoh key prefix (optional): You usually do not need to change this.
-
-In a regular mix project, you can set these values in [`config/config.exs`](https://giocci.hexdocs.pm/readme.html#configuration) and `zenoh.json5`.
-
-After setting these values, run the next cell.
-
-```elixir
-client_name = "image-demo-#{System.pid()}-#{System.unique_integer([:positive])}"
-relay = "giocci_relay"
-endpoints = ["tcp/127.0.0.1:7447"]
-key_prefix = ""
-
-Application.put_env(:giocci, :client_name, client_name)
-System.put_env("ZENOHD_CONNECT_ENDPOINTS", Enum.join(endpoints, ","))
-Application.put_env(:giocci, :zenoh_config_file_path, nil)
-Application.put_env(:giocci, :key_prefix, key_prefix)
-
-if List.keymember?(Application.started_applications(), :giocci, 0),
-  do: Application.stop(:giocci)
-{:ok, _} = Application.ensure_all_started(:giocci)
-
-:ok = Giocci.register_client(relay)
-
-IO.puts("Registered Client #{client_name} with #{relay}")
-```
+The connection cell in section 1 has already called `register_client` and checked for registered Engines.
+If you change the connection settings, rerun section 1 and the following cells to save the modules for that Client again.
 
 ### b) Save the module
 
@@ -594,7 +608,7 @@ Kino.render(
 
 ## 7. Check connections and saved code with Inspect
 
-[`Giocci.Inspect`](https://giocci.hexdocs.pm/Giocci.Inspect.html) lets you check Giocci connections, registrations, and BEAMs saved on the Relay (it was added in [v0.6.2](https://github.com/biyooon-ex/giocci_platform/releases/tag/v0.6.2), released just last week!).
+[`Giocci.Inspect`](https://giocci.hexdocs.pm/Giocci.Inspect.html) lets you check Giocci connections, registrations, and BEAMs saved on the Relay (it was added in [v0.6.2](https://github.com/biyooon-ex/giocci_platform/releases/tag/v0.6.2)).
 After running the three apps, review the remote execution environments and the saved code.
 
 First, check your Client name, key_prefix, Zenoh ID, the IDs of connected Routers/Peers, and registered Relays.
@@ -658,7 +672,8 @@ Can Giocci actually make processing faster?
 
 For each app, alternate between Local and the Giocci synchronous API, running each three times.
 We measure the total function call time, including communication, and the kernel time for the filter itself.
-When multiple Engines are registered, the execution destination changes between measurements.
+One Engine is enough for this comparison. When multiple Engines are registered, the execution destination may change between measurements.
+Local execution may be faster, especially when the Engine is on the same PC or the network is slow. Gaussian blur also depends on the number of available BEAM schedulers. The purpose is to compare the results in your environment, not to reach a fixed speedup.
 
 The Giocci total time includes Engine selection, sending and receiving data, waiting, and receiving the result.
 For light tasks such as Grayscale, we can also observe that Giocci may be slower because of communication time.
@@ -743,7 +758,14 @@ Kino.render(Kino.Layout.grid(comparisons, gap: 24))
 
 Next, please try the demo in [giocci_live_image_demo.livemd](https://github.com/biyooon-ex/nerves_livebook/blob/v0.19.0-gioccidemo/priv/giocci/giocci_live_image_demo.livemd)!
 
-For Trouble shooting, check that Zenohd is running, that the IP address in `endpoints` is correct, and that the Relay and Engine are running correctly.
+If something does not work, check the stage that failed:
+
+* Connection: check `endpoints`, `relay`, and `key_prefix`, and that Zenohd and the Relay are running.
+* No registered Engines: check the Engine's Relay name and configuration. Section 7 also provides Engine information and response checks.
+* Image download: check Internet access from the Elixir runtime. You can replace `image_url` with another directly accessible image URL.
+* Remote execution: check the Engine logs and Elixir/OTP compatibility. A timeout can also mean that processing or communication took too long.
+
+The calls in this hands-on notebook use the default Giocci timeout. You can adjust it for a slower environment using the API's `timeout` option.
 
 You can find me on the Elixir, Nerves, and AtomVM Discord servers! I am also in the Elixir, Erlang, and EEF Slack Workspaces. If you have any trouble, please contact `@takasehideki`!
 
